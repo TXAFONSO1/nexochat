@@ -1,4 +1,4 @@
-const CACHE = 'nexo-v4';
+const CACHE = 'nexo-v5';
 const SHELL = ['/', '/style.css', '/app.js', '/js/voice.js', '/manifest.webmanifest', '/icon.svg'];
 
 self.addEventListener('install', e => {

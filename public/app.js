@@ -1,3 +1,5 @@
+window.__nexoBooted = false;
+
 const API = {
   token: localStorage.getItem('nexo_token') || null,
   async req(path, options = {}) {
@@ -469,7 +471,8 @@ function welcomeModal() {
         <button class="btn-primary" id="m-create" style="padding:10px 16px;border-radius:6px;">Criar servidor</button>
       </div>`;
     modal.querySelector('#m-create').addEventListener('click', createServerModal);
-    modal.querySelector('#m-join')?.remove();
+    const joinBtn = modal.querySelector('#m-join');
+    if (joinBtn) joinBtn.remove();
     modal.querySelector('#m-copy').addEventListener('click', () => {
       navigator.clipboard.writeText(handleOf(state.me));
       modal.querySelector('#m-copy').textContent = 'Copiado!';
@@ -583,7 +586,8 @@ function updateHeaderButtons() {
   el('btn-new-channel').classList.toggle('hidden', isHome);
   el('btn-invite').classList.toggle('hidden', isHome);
   el('btn-server-menu').classList.toggle('hidden', isHome);
-  el('btn-search')?.classList.toggle('hidden', isHome);
+  const searchBtn = el('btn-search');
+  if (searchBtn) searchBtn.classList.toggle('hidden', isHome);
 }
 
 async function refreshMembers() {
@@ -1109,10 +1113,11 @@ function emojiPicker(callback, small) {
 function insertEmojiAtCursor(em) {
   const inp = el('message-input');
   if (inp.disabled) return;
-  const start = inp.selectionStart ?? inp.value.length;
-  inp.value = inp.value.slice(0, start) + em + inp.value.slice(inp.selectionEnd ?? start);
+  const selStart = inp.selectionStart === null || inp.selectionStart === undefined ? inp.value.length : inp.selectionStart;
+  const selEnd = inp.selectionEnd === null || inp.selectionEnd === undefined ? selStart : inp.selectionEnd;
+  inp.value = inp.value.slice(0, selStart) + em + inp.value.slice(selEnd);
   inp.focus();
-  inp.selectionStart = inp.selectionEnd = start + em.length;
+  inp.selectionStart = inp.selectionEnd = selStart + em.length;
 }
 
 el('btn-emoji').addEventListener('click', () => emojiPicker(insertEmojiAtCursor));
@@ -1331,11 +1336,13 @@ function renderMessages() {
   if (!state.messages.length) {
     let ctxName;
     if (state.homeMode && state.activeDmPeerId) {
-      ctxName = '@' + (state.dms.find(d => d.partner.id === state.activeDmPeerId)?.partner.username || '');
+      const dm = state.dms.find(d => d.partner.id === state.activeDmPeerId);
+      ctxName = '@' + (dm ? dm.partner.username : '');
     } else if (state.homeMode) {
       ctxName = 'Mensagens diretas';
     } else {
-      ctxName = '#' + (state.channels.find(c => c.id === state.currentChannelId)?.name || '');
+      const ch = state.channels.find(c => c.id === state.currentChannelId);
+      ctxName = '#' + (ch ? ch.name : '');
     }
     const welcome = document.createElement('div');
     welcome.className = 'welcome-block';
@@ -2658,4 +2665,4 @@ const onSafe = (id, fn) => { const n = el(id); if (n) n.addEventListener('click'
 onSafe('btn-pins', pinsModal);
 onSafe('btn-search', searchModal);
 
-boot();
+boot().then(() => { window.__nexoBooted = true; }).catch(() => {});
