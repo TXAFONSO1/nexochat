@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Nexo — chat leve</title>
+  <link rel="manifest" href="/manifest.webmanifest">
+  <meta name="theme-color" content="#5865f2">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <link rel="apple-touch-icon" href="/icon.svg">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='%235865f2'/><text x='50' y='68' font-size='52' text-anchor='middle' fill='white' font-family='Arial'>N</text></svg>">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+  <div id="auth-view" class="auth-view hidden">
+    <div class="auth-card">
+      <div class="auth-logo">N</div>
+      <h1>Bem-vindo ao Nexo</h1>
+      <p class="auth-sub">O chat leve para a sua comunidade</p>
+
+      <div class="auth-tabs">
+        <button id="tab-login" class="auth-tab active">Entrar</button>
+        <button id="tab-register" class="auth-tab">Criar conta</button>
+      </div>
+
+      <form id="login-form" class="auth-form">
+        <label>Nome de usuario
+          <input type="text" id="login-username" autocomplete="username" maxlength="24" required>
+        </label>
+        <label>Senha
+          <input type="password" id="login-password" autocomplete="current-password" required>
+        </label>
+        <div class="auth-error hidden" id="login-error"></div>
+        <button type="submit" class="btn-primary">Entrar</button>
+      </form>
+
+      <form id="register-form" class="auth-form hidden">
+        <label>Nome de usuario
+          <input type="text" id="reg-username" autocomplete="username" maxlength="24" required>
+        </label>
+        <label>Senha (min. 6 caracteres)
+          <input type="password" id="reg-password" autocomplete="new-password" required>
+        </label>
+        <div class="auth-error hidden" id="reg-error"></div>
+        <button type="submit" class="btn-primary">Criar conta</button>
+      </form>
+    </div>
+  </div>
+
+  <div id="app-view" class="app-view">
+    <nav class="server-rail" id="server-rail"></nav>
+
+    <aside class="sidebar">
+      <header class="sidebar-header">
+        <span id="server-name">Nexo</span>
+        <div class="sidebar-header-actions">
+          <button id="btn-add-friend" class="icon-btn hidden" title="Adicionar amigo">&#128100;</button>
+          <button id="btn-new-channel" class="icon-btn" title="Criar canal">+</button>
+          <button id="btn-invite" class="icon-btn" title="Convidar pessoas">&#10095;</button>
+          <button id="btn-server-menu" class="icon-btn" title="Opcoes do servidor">&#9776;</button>
+        </div>
+      </header>
+      <div class="channel-list" id="channel-list"></div>
+      <footer class="user-panel">
+        <div class="avatar avatar-sm" id="me-avatar"></div>
+        <div class="user-panel-info">
+          <strong id="me-name"></strong>
+          <button id="me-handle" class="me-handle" title="Clique para copiar seu codigo"></button>
+        </div>
+        <button id="btn-logout" class="icon-btn" title="Sair da conta">&#10148;</button>
+      </footer>
+    </aside>
+
+    <main class="chat-area">
+      <header class="chat-header">
+        <span class="hash">#</span>
+        <strong id="channel-name">Selecione um canal</strong>
+        <span class="chat-header-topic" id="channel-topic"></span>
+        <button id="btn-members-toggle" class="icon-btn" title="Membros">&#128101;</button>
+      </header>
+
+      <section id="voice-stage" class="voice-stage hidden"></section>
+
+      <div class="messages-wrapper">
+        <div class="messages" id="messages"></div>
+        <div class="typing-indicator" id="typing-indicator"></div>
+      </div>
+
+      <div class="composer">
+        <div class="attachment-chips" id="attachment-chips"></div>
+        <div class="composer-row">
+          <input type="file" id="file-input" multiple hidden>
+          <button id="btn-attach" class="composer-btn" title="Enviar arquivo">&#128206;</button>
+          <button id="btn-photo" class="composer-btn" title="Tirar foto">&#128247;</button>
+          <button id="btn-emoji" class="composer-btn" title="Emoji">&#128512;</button>
+          <input type="text" id="message-input" placeholder="Conversar em #..." maxlength="2000" disabled>
+        </div>
+      </div>
+    </main>
+
+    <aside class="members-panel" id="members-panel">
+      <h3>ONLINE — <span id="online-count">0</span></h3>
+      <div id="members-online"></div>
+      <h3>OFFLINE — <span id="offline-count">0</span></h3>
+      <div id="members-offline"></div>
+    </aside>
+  </div>
+
+  <div id="modal-backdrop" class="modal-backdrop hidden">
+    <div class="modal" id="modal-content"></div>
+  </div>
+
+  <script src="/js/voice.js"></script>
+  <script src="/app.js"></script>
+  <script>
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => {
+        navigator.serviceWorker.register('/sw.js').catch(() => {});
+      });
+    }
+  </script>
+</body>
+</html>

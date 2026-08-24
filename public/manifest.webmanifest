@@ -1,0 +1,15 @@
+{
+  "name": "Nexo — chat leve",
+  "short_name": "Nexo",
+  "description": "Chat leve estilo Discord: servidores, voz, DMs e amigos.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#313338",
+  "theme_color": "#5865f2",
+  "icons": [
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" },
+    { "src": "/icon-maskable.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "maskable" }
+  ]
+}
