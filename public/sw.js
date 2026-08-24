@@ -1,4 +1,4 @@
-const CACHE = 'nexo-v3';
+const CACHE = 'nexo-v4';
 const SHELL = ['/', '/style.css', '/app.js', '/js/voice.js', '/manifest.webmanifest', '/icon.svg'];
 
 self.addEventListener('install', e => {
@@ -21,6 +21,22 @@ self.addEventListener('fetch', e => {
   const url = new URL(e.request.url);
   if (e.request.method !== 'GET') return;
   if (url.pathname.startsWith('/api/') || url.pathname === '/sse' || url.pathname.startsWith('/files/')) return;
+
+  // rede primeiro: so usa cache se a rede falhar (app offline)
+  if (SHELL.includes(url.pathname)) {
+    e.respondWith(
+      fetch(e.request)
+        .then(res => {
+          if (res && res.status === 200 && res.type === 'basic') {
+            const copy = res.clone();
+            caches.open(CACHE).then(cache => cache.put(e.request, copy));
+          }
+          return res;
+        })
+        .catch(() => caches.open(CACHE).then(cache => cache.match(e.request)).then(m => m || Response.error()))
+    );
+    return;
+  }
 
   e.respondWith(
     caches.open(CACHE).then(async cache => {

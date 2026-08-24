@@ -583,7 +583,7 @@ function updateHeaderButtons() {
   el('btn-new-channel').classList.toggle('hidden', isHome);
   el('btn-invite').classList.toggle('hidden', isHome);
   el('btn-server-menu').classList.toggle('hidden', isHome);
-  el('btn-search').classList.toggle('hidden', isHome);
+  el('btn-search')?.classList.toggle('hidden', isHome);
 }
 
 async function refreshMembers() {
@@ -2654,7 +2654,8 @@ el('btn-members-toggle').addEventListener('click', () => {
   appView.classList.toggle('members-hidden');
 });
 
-el('btn-pins').addEventListener('click', pinsModal);
-el('btn-search').addEventListener('click', searchModal);
+const onSafe = (id, fn) => { const n = el(id); if (n) n.addEventListener('click', fn); };
+onSafe('btn-pins', pinsModal);
+onSafe('btn-search', searchModal);
 
 boot();
