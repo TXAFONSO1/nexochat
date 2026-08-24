@@ -155,6 +155,17 @@ function serversOf(userId) {
     .filter(Boolean);
 }
 
+function publicServer(s) {
+  return {
+    id: s.id,
+    name: s.name,
+    inviteCode: s.inviteCode,
+    ownerId: s.ownerId,
+    createdAt: s.createdAt,
+    iconUrl: s.iconFile ? `/api/server-icons/${s.id}?v=${s.iconV || 0}` : null
+  };
+}
+
 function isMember(serverId, userId) {
   return store.db.members.some(m => m.serverId === serverId && m.userId === userId);
 }
@@ -338,11 +349,24 @@ function addBotMembership(serverId, botUserId) {
   }
 }
 
-function postMessageInternal(user, channelId, content, attachmentIds) {
+function postMessageInternal(user, channelId, content, attachmentIds, replyToId) {
   const channel = store.db.channels.find(c => c.id === channelId);
   const isDm = channelId.startsWith('dm_');
   if (!isDm && !channel) return null;
   const now = Date.now();
+  let replySnapshot = null;
+  if (replyToId) {
+    const orig = store.db.messages.find(m => m.id === replyToId && m.channelId === channelId);
+    if (orig) {
+      replySnapshot = {
+        id: orig.id,
+        userId: orig.userId,
+        username: orig.username,
+        content: String(orig.content || '').slice(0, 120),
+        hasAttachment: (orig.attachments || []).length > 0
+      };
+    }
+  }
   const attachments = (attachmentIds || [])
     .map(id => store.db.attachments.find(a => a.id === id))
     .filter(Boolean)
@@ -375,6 +399,7 @@ function postMessageInternal(user, channelId, content, attachmentIds) {
     isBot: !!user.isBot,
     content,
     attachments,
+    replyTo: replySnapshot,
     reactions: {},
     editedAt: null,
     pinned: false,
@@ -477,7 +502,7 @@ async function handleUpload(req, res, url, me) {
 
 async function handleApi(req, res, url) {
   const route = `${req.method} ${url.pathname}`;
-  const isUpload = route === 'POST /api/upload' || route === 'POST /api/me/avatar';
+  const isUpload = route === 'POST /api/upload' || route === 'POST /api/me/avatar' || /^POST \/api\/servers\/[a-z0-9]+\/icon$/.test(route);
   const body = !isUpload && ['POST', 'PUT', 'PATCH'].includes(req.method) ? await readBody(req) : {};
   const me = getAuthUser(req);
   let match = null;
@@ -560,10 +585,21 @@ async function handleApi(req, res, url) {
     return res.end(fs.readFileSync(filePath));
   }
 
+  match = url.pathname.match(/^\/api\/server-icons\/([a-z0-9]+)$/);
+  if (match && req.method === 'GET') {
+    const s = store.db.servers.find(x => x.id === match[1]);
+    if (!s || !s.iconFile) return json(res, 404, { error: 'Sem icone' });
+    const filePath = path.join(UPLOAD_DIR, s.iconFile);
+    if (!fs.existsSync(filePath)) return json(res, 404, { error: 'Sem icone' });
+    const ctype = s.iconFile.endsWith('.png') ? 'image/png' : s.iconFile.endsWith('.gif') ? 'image/gif' : s.iconFile.endsWith('.webp') ? 'image/webp' : 'image/jpeg';
+    res.writeHead(200, { 'Content-Type': ctype, 'Cache-Control': 'no-cache' });
+    return res.end(fs.readFileSync(filePath));
+  }
+
   if (!me) return json(res, 401, { error: 'Nao autenticado' });
 
   if (route === 'GET /api/me') {
-    return json(res, 200, { user: publicUser(me), servers: serversOf(me.id) });
+    return json(res, 200, { user: publicUser(me), servers: serversOf(me.id).map(publicServer) });
   }
 
   if (route === 'PATCH /api/me/status') {
@@ -610,6 +646,33 @@ async function handleApi(req, res, url) {
     return json(res, 200, { user: publicUser(me) });
   }
 
+  match = url.pathname.match(/^\/api\/servers\/([a-z0-9]+)\/icon$/);
+  if (match && req.method === 'POST') {
+    const server = store.db.servers.find(s => s.id === match[1]);
+    if (!server || !canModerate(server.id, me.id)) return json(res, 403, { error: 'Sem permissao' });
+    const ctype = String(req.headers['content-type'] || '');
+    const exts = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/gif': 'gif', 'image/webp': 'webp' };
+    const ext = exts[ctype.split(';')[0].trim()];
+    if (!ext) return json(res, 400, { error: 'Envie uma imagem PNG, JPG, GIF ou WEBP' });
+    let raw;
+    try {
+      raw = await readRaw(req, 512 * 1024);
+    } catch {
+      return json(res, 413, { error: 'Imagem grande demais (max 512 KB)' });
+    }
+    fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+    const name = `srv_${server.id}_${Date.now()}.${ext}`;
+    fs.writeFileSync(path.join(UPLOAD_DIR, name), raw);
+    if (server.iconFile && server.iconFile !== name) {
+      try { fs.unlinkSync(path.join(UPLOAD_DIR, server.iconFile)); } catch {}
+    }
+    server.iconFile = name;
+    server.iconV = Date.now();
+    store.save();
+    broadcastServer(server.id, { type: 'server_update', server: publicServer(server) });
+    return json(res, 200, { server: publicServer(server) });
+  }
+
   if (route === 'POST /api/logout') {
     delete store.db.sessions[tokenFromReq(req)];
     store.save();
@@ -631,7 +694,7 @@ async function handleApi(req, res, url) {
     store.db.members.push({ serverId: server.id, userId: me.id, joinedAt: Date.now() });
     addBotMembership(server.id, ensureNexoBot().id);
     store.save();
-    return json(res, 201, { server, channels: [textChannel, voiceChannel] });
+    return json(res, 201, { server: publicServer(server), channels: [textChannel, voiceChannel] });
   }
 
   if (route === 'POST /api/servers/join') {
@@ -652,7 +715,7 @@ async function handleApi(req, res, url) {
       }, me.id);
     }
     const channels = store.db.channels.filter(c => c.serverId === server.id).sort((a, b) => a.position - b.position);
-    return json(res, 200, { server, channels });
+    return json(res, 200, { server: publicServer(server), channels });
   }
 
   match = url.pathname.match(/^\/api\/servers\/([a-z0-9]+)\/channels$/);
@@ -813,9 +876,18 @@ async function handleApi(req, res, url) {
     const channelId = match[1];
     const channel = store.db.channels.find(c => c.id === channelId);
     if (!channel || !canModerate(channel.serverId, me.id)) return json(res, 403, { error: 'Sem permissao' });
-    const name = String(body.name || '').trim().toLowerCase().replace(/\s+/g, '-').slice(0, 32);
-    if (!/^[a-z0-9_-]{2,32}$/.test(name)) return json(res, 400, { error: 'Nome de canal invalido' });
-    channel.name = name;
+    let changed = false;
+    if (typeof body.name === 'string' && body.name.trim()) {
+      const name = body.name.trim().toLowerCase().replace(/\s+/g, '-').slice(0, 32);
+      if (!/^[a-z0-9_-]{2,32}$/.test(name)) return json(res, 400, { error: 'Nome de canal invalido' });
+      channel.name = name;
+      changed = true;
+    }
+    if (typeof body.topic === 'string') {
+      channel.topic = body.topic.trim().slice(0, 200);
+      changed = true;
+    }
+    if (!changed) return json(res, 400, { error: 'Nada para atualizar' });
     store.save();
     broadcastServer(channel.serverId, { type: 'channel_update', channel });
     return json(res, 200, { channel });
@@ -843,7 +915,13 @@ async function handleApi(req, res, url) {
     const channel = store.db.channels.find(c => c.id === channelId);
     if (!channel || !isMember(channel.serverId, me.id)) return json(res, 403, { error: 'Sem acesso' });
     const limit = Math.min(parseInt(url.searchParams.get('limit')) || 50, 100);
-    const messages = store.db.messages.filter(m => m.channelId === channelId).slice(-limit);
+    let list = store.db.messages.filter(m => m.channelId === channelId);
+    const before = url.searchParams.get('before');
+    if (before) {
+      const idx = list.findIndex(m => m.id === before);
+      if (idx >= 0) list = list.slice(0, idx);
+    }
+    const messages = list.slice(-limit);
     return json(res, 200, { messages });
   }
 
@@ -858,7 +936,7 @@ async function handleApi(req, res, url) {
       return json(res, 429, { error: 'Muito rapido' });
     }
     lastMessageAt.set(me.id, now);
-    const message = postMessageInternal(me, channelId, content, body.attachmentIds);
+    const message = postMessageInternal(me, channelId, content, body.attachmentIds, body.replyToId);
     if (!message) return json(res, 400, { error: 'Falha ao enviar' });
     handleBotCommands(message);
     return json(res, 201, { message });
@@ -866,19 +944,37 @@ async function handleApi(req, res, url) {
 
   match = url.pathname.match(/^\/api\/typing$/);
   if (match && req.method === 'POST') {
-    const channel = store.db.channels.find(c => c.id === body.channelId);
-    if (!channel || !isMember(channel.serverId, me.id)) return json(res, 403, { error: 'Sem acesso' });
+    let targetKey = null;
+    let targetServerId = null;
+    const peerId = String(body.peerId || '');
+    const peer = peerId ? store.db.users.find(u => u.id === peerId) : null;
+    if (peer && peer.id !== me.id) {
+      if (!sharesServer(me.id, peer.id) && !areFriends(me.id, peer.id)) return json(res, 403, { error: 'Sem acesso' });
+      targetKey = dmKey(me.id, peer.id);
+    } else {
+      const channel = store.db.channels.find(c => c.id === body.channelId);
+      if (!channel || !isMember(channel.serverId, me.id)) return json(res, 403, { error: 'Sem acesso' });
+      targetKey = channel.id;
+      targetServerId = channel.serverId;
+    }
     const now = Date.now();
     if (lastTypingAt.get(me.id) && now - lastTypingAt.get(me.id) < 2500) {
       return json(res, 200, { ok: true });
     }
     lastTypingAt.set(me.id, now);
-    broadcastServer(channel.serverId, {
+    const event = {
       type: 'typing',
-      channelId: channel.id,
+      channelId: targetKey,
       userId: me.id,
       username: me.username
-    }, me.id);
+    };
+    if (targetKey.startsWith('dm_')) {
+      const parts = targetKey.split('_');
+      sendToUser(parts[1], event);
+      sendToUser(parts[2], event);
+    } else {
+      broadcastServer(targetServerId, event, me.id);
+    }
     return json(res, 200, { ok: true });
   }
 
@@ -1032,7 +1128,13 @@ async function handleApi(req, res, url) {
     const key = dmKey(me.id, peerId);
     if (req.method === 'GET') {
       const limit = Math.min(parseInt(url.searchParams.get('limit')) || 50, 100);
-      const messages = store.db.messages.filter(m => m.channelId === key).slice(-limit);
+      let list = store.db.messages.filter(m => m.channelId === key);
+      const before = url.searchParams.get('before');
+      if (before) {
+        const idx = list.findIndex(m => m.id === before);
+        if (idx >= 0) list = list.slice(0, idx);
+      }
+      const messages = list.slice(-limit);
       return json(res, 200, { messages, peer: publicUser(peer) });
     }
     if (req.method === 'POST') {
@@ -1046,7 +1148,7 @@ async function handleApi(req, res, url) {
         return json(res, 429, { error: 'Muito rapido' });
       }
       lastMessageAt.set(me.id, now);
-      const message = postMessageInternal(me, key, content, body.attachmentIds);
+      const message = postMessageInternal(me, key, content, body.attachmentIds, body.replyToId);
       return json(res, 201, { message });
     }
   }
@@ -1320,6 +1422,10 @@ function migrate() {
   }
   for (const s of store.db.servers) {
     if (!s.bans) { s.bans = []; changed = true; }
+    if (s.iconFile === undefined) { s.iconFile = null; s.iconV = 0; changed = true; }
+  }
+  for (const c of store.db.channels) {
+    if (c.topic === undefined) { c.topic = ''; changed = true; }
   }
   for (const msg of store.db.messages) {
     if (!msg.reactions) {

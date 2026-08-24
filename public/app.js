@@ -4,7 +4,8 @@ const API = {
   token: localStorage.getItem('nexo_token') || null,
   async req(path, options = {}) {
     const headers = {};
-    if (!(options.body instanceof FormData)) headers['Content-Type'] = 'application/json';
+    const isRaw = options.body instanceof FormData || options.body instanceof Blob || options.body instanceof ArrayBuffer;
+    if (!isRaw) headers['Content-Type'] = 'application/json';
     if (this.token) headers['Authorization'] = `Bearer ${this.token}`;
     const res = await fetch(path, { ...options, headers });
     const data = await res.json().catch(() => ({}));
@@ -43,7 +44,10 @@ const state = {
   outgoingReqs: [],
   voiceRooms: new Map(),
   pendingAttachments: [],
-  unreadChannels: new Map()
+  unreadChannels: new Map(),
+  replyingTo: null,
+  haveMoreMessages: false,
+  loadingOlder: false
 };
 
 const el = id => document.getElementById(id);
@@ -326,6 +330,7 @@ function handleRealtime(event) {
     case 'presence_status': onPresenceStatus(event); break;
     case 'member_leave': onMemberLeave(event); break;
     case 'channel_update': onChannelUpdate(event.channel); break;
+    case 'server_update': onServerUpdate(event.server); break;
     case 'channel_delete': onChannelDelete(event); break;
     case 'invite_regenerated': onInviteRegenerated(event); break;
     case 'server_deleted': onServerDeleted(event); break;
@@ -537,8 +542,16 @@ function renderRail() {
     const btn = document.createElement('button');
     const active = !state.homeMode && server.id === state.currentServerId;
     btn.className = 'server-icon' + (active ? ' active' : '') + (state.unreadServers.has(server.id) ? ' unread' : '');
-    btn.textContent = initials(server.name);
     btn.title = server.name;
+    if (server.iconUrl) {
+      btn.textContent = '';
+      const img = document.createElement('img');
+      img.src = server.iconUrl;
+      img.alt = '';
+      btn.appendChild(img);
+    } else {
+      btn.textContent = initials(server.name);
+    }
     btn.addEventListener('click', () => selectServer(server.id));
     rail.appendChild(btn);
   }
@@ -994,6 +1007,7 @@ function addFriendModal() {
 async function openDm(peerId) {
   state.activeDmPeerId = peerId;
   state.unreadDms.delete(peerId);
+  clearReplyingTo();
   renderRail();
   renderSidebar();
 
@@ -1001,6 +1015,8 @@ async function openDm(peerId) {
   if (!data) return;
   if (state.activeDmPeerId !== peerId) return;
   state.messages = data.messages;
+  state.haveMoreMessages = data.messages.length >= 50;
+  state.loadingOlder = false;
   renderMessages();
   updateChatHeader(null, data.peer);
   el('message-input').focus();
@@ -1011,6 +1027,7 @@ async function selectChannel(channelId, keepVoice) {
   state.typing.clear();
   renderTyping();
   state.unreadChannels.delete(channelId);
+  clearReplyingTo();
   renderChannels();
   const channel = state.channels.find(c => c.id === channelId);
   updateChatHeader(channel, null);
@@ -1019,6 +1036,8 @@ async function selectChannel(channelId, keepVoice) {
   if (!data) return;
   if (state.currentChannelId !== channelId) return;
   state.messages = data.messages;
+  state.haveMoreMessages = data.messages.length >= 50;
+  state.loadingOlder = false;
   renderMessages();
   renderVoiceStage();
   if (channel && channel.type !== 'voice') el('message-input').focus();
@@ -1046,7 +1065,9 @@ function updateChatHeader(channel, dmPeer) {
   const isVoice = channel.type === 'voice';
   hashEl.innerHTML = isVoice ? '&#128266;' : '#';
   el('channel-name').textContent = channel.name;
-  el('channel-topic').textContent = isVoice ? 'Canal de voz - chat de texto abaixo' : `Bem-vindo ao #${channel.name}`;
+  el('channel-topic').textContent = isVoice
+    ? 'Canal de voz - chat de texto abaixo'
+    : (channel.topic || `Bem-vindo ao #${channel.name}`);
   el('message-input').disabled = false;
   el('message-input').placeholder = isVoice ? `Chat do canal ${channel.name}` : `Conversar em #${channel.name}`;
 }
@@ -1196,6 +1217,7 @@ function messageActions(msg) {
     bar.appendChild(b);
   };
 
+  mkBtn('&#8617;', 'Responder', () => setReplyingTo(msg));
   mkBtn('&#128512;', 'Reagir', () => emojiPicker(em => toggleReaction(msg, em), true));
 
   const canPin = msg.userId === state.me.id ||
@@ -1286,6 +1308,22 @@ function messageEl(msg, grouped) {
 
   const body = document.createElement('div');
   body.className = 'message-body';
+
+  if (msg.replyTo) {
+    const quote = document.createElement('div');
+    quote.className = 'reply-quote';
+    const qname = document.createElement('span');
+    qname.className = 'rq-name';
+    qname.textContent = msg.replyTo.username;
+    const qtext = document.createElement('span');
+    qtext.className = 'rq-text';
+    qtext.textContent = msg.replyTo.hasAttachment ? '(anexo)' : msg.replyTo.content;
+    quote.appendChild(qname);
+    quote.appendChild(qtext);
+    quote.title = 'Ir para a mensagem original';
+    quote.addEventListener('click', () => jumpToMessage(msg.replyTo.id));
+    body.appendChild(quote);
+  }
 
   if (!grouped) {
     row.appendChild(avatarEl({ color: roleColorOf(msg), username: msg.username }));
@@ -1462,7 +1500,11 @@ function clearTyping(userId) {
 
 function onTyping(event) {
   if (event.userId === state.me.id) return;
-  if (event.channelId !== state.currentChannelId || state.homeMode) return;
+  let expected = state.currentChannelId;
+  if (state.homeMode && state.activeDmPeerId) {
+    expected = dmKeyClient(state.me.id, state.activeDmPeerId);
+  }
+  if (!expected || event.channelId !== expected) return;
   state.typing.set(event.userId, event.username);
   renderTyping();
   clearTimeout(typingTimer);
@@ -1470,6 +1512,10 @@ function onTyping(event) {
     state.typing.clear();
     renderTyping();
   }, 3500);
+}
+
+function dmKeyClient(a, b) {
+  return 'dm_' + [a, b].sort().join('_');
 }
 
 function onPresence(event) {
@@ -1507,6 +1553,13 @@ function onChannelCreate(channel) {
     state.channels.push(channel);
     renderSidebar();
   }
+}
+
+function onServerUpdate(server) {
+  const idx = state.servers.findIndex(s => s.id === server.id);
+  if (idx >= 0) state.servers[idx] = { ...state.servers[idx], ...server };
+  else state.servers.push(server);
+  renderRail();
 }
 
 function onVoiceState(event) {
@@ -1831,11 +1884,46 @@ input.addEventListener('keydown', e => {
   if (e.key === 'Enter') sendMessage();
 });
 input.addEventListener('input', () => {
-  if (state.homeMode || !state.currentChannelId) return;
   const now = Date.now();
-  if (now - state.lastTypingSent > 2500) {
+  if (now - state.lastTypingSent <= 2500) return;
+  if (!state.homeMode && state.currentChannelId) {
     state.lastTypingSent = now;
     API.post('/api/typing', { channelId: state.currentChannelId }).catch(() => {});
+  } else if (state.homeMode && state.activeDmPeerId) {
+    state.lastTypingSent = now;
+    API.post('/api/typing', { peerId: state.activeDmPeerId }).catch(() => {});
+  }
+});
+
+el('messages').addEventListener('scroll', async () => {
+  const box = el('messages');
+  if (box.scrollTop > 80 || state.loadingOlder || !state.haveMoreMessages || !state.messages.length) return;
+  const isDm = state.homeMode && !!state.activeDmPeerId;
+  if (isDm ? !state.activeDmPeerId : !state.currentChannelId) return;
+  state.loadingOlder = true;
+  const oldest = state.messages[0].id;
+  const ctx = isDm ? state.activeDmPeerId : state.currentChannelId;
+  try {
+    const url = isDm
+      ? `/api/dms/${ctx}/messages?limit=50&before=${oldest}`
+      : `/api/channels/${ctx}/messages?limit=50&before=${oldest}`;
+    const data = await apiErrorGuard(() => API.get(url));
+    if (!data) return;
+    const stillSame = isDm ? state.activeDmPeerId === ctx && state.homeMode : state.currentChannelId === ctx && !state.homeMode;
+    if (!stillSame) return;
+    state.messages = data.messages.concat(state.messages);
+    state.haveMoreMessages = data.messages.length >= 50;
+    const st = box.scrollTop;
+    const sh = box.scrollHeight;
+    renderMessages();
+    requestAnimationFrame(() => {
+      const b = el('messages');
+      b.scrollTop = b.scrollHeight - sh + st;
+    });
+  } catch (err) {
+    /* silencioso */
+  } finally {
+    state.loadingOlder = false;
   }
 });
 
@@ -1844,16 +1932,18 @@ async function sendMessage() {
   const attachmentIds = state.pendingAttachments.map(a => a.attachment.id);
   if (!content && !attachmentIds.length) return;
 
+  const replyToId = state.replyingTo ? state.replyingTo.id : null;
   let request;
   if (state.homeMode && state.activeDmPeerId) {
-    request = () => API.post(`/api/dms/${state.activeDmPeerId}/messages`, { content, attachmentIds });
+    request = () => API.post(`/api/dms/${state.activeDmPeerId}/messages`, { content, attachmentIds, replyToId });
   } else if (state.currentChannelId) {
-    request = () => API.post(`/api/channels/${state.currentChannelId}/messages`, { content, attachmentIds });
+    request = () => API.post(`/api/channels/${state.currentChannelId}/messages`, { content, attachmentIds, replyToId });
   } else {
     return;
   }
 
   input.value = '';
+  clearReplyingTo();
   state.pendingAttachments = [];
   renderAttachmentChips();
   try {
@@ -1861,6 +1951,36 @@ async function sendMessage() {
   } catch (err) {
     alert(err.message);
   }
+}
+
+function setReplyingTo(msg) {
+  if (state.homeMode && !state.activeDmPeerId) return;
+  state.replyingTo = { id: msg.id, username: msg.username };
+  renderReplyChip();
+  input.focus();
+}
+
+function clearReplyingTo() {
+  state.replyingTo = null;
+  renderReplyChip();
+}
+
+function renderReplyChip() {
+  const chip = el('reply-chip');
+  if (!chip) return;
+  if (!state.replyingTo) {
+    chip.classList.add('hidden');
+    chip.innerHTML = '';
+    return;
+  }
+  chip.innerHTML = `<span class="reply-chip-label">&#8617; Respondendo a <strong>${escapeHtml(state.replyingTo.username)}</strong></span>`;
+  const cancel = document.createElement('button');
+  cancel.className = 'reply-chip-cancel';
+  cancel.textContent = 'x';
+  cancel.title = 'Cancelar resposta';
+  cancel.addEventListener('click', clearReplyingTo);
+  chip.appendChild(cancel);
+  chip.classList.remove('hidden');
 }
 
 function renderAttachmentChips() {
@@ -2499,17 +2619,23 @@ function channelManageModal(ch) {
       <label>Novo nome
         <input type="text" id="m-ch-name" maxlength="32" value="${escapeHtml(ch.name)}">
       </label>
+      ${ch.type !== 'voice' ? `<label>Topico do canal
+        <input type="text" id="m-ch-topic" maxlength="200" value="${escapeHtml(ch.topic || '')}" placeholder="Ex: Conversa geral da galera">
+      </label>` : ''}
       <div class="auth-error hidden" id="m-ch-error"></div>
       <div class="modal-actions">
         <button class="btn-secondary" id="m-cancel">Cancelar</button>
-        ${ch.type !== 'voice' ? '<button class="btn-primary" id="m-save" style="padding:10px 16px;border-radius:6px;">Salvar</button>' : ''}
+        <button class="btn-primary" id="m-save" style="padding:10px 16px;border-radius:6px;">Salvar</button>
         <button class="btn-secondary btn-danger-text" id="m-delete">&#128465; Excluir canal</button>
       </div>`;
     modal.querySelector('#m-cancel').addEventListener('click', closeModal);
     const saveBtn = modal.querySelector('#m-save');
     if (saveBtn) saveBtn.addEventListener('click', async () => {
       try {
-        await API.patch(`/api/channels/${ch.id}`, { name: modal.querySelector('#m-ch-name').value });
+        const payload = { name: modal.querySelector('#m-ch-name').value };
+        const topicInput = modal.querySelector('#m-ch-topic');
+        if (topicInput) payload.topic = topicInput.value;
+        await API.patch(`/api/channels/${ch.id}`, payload);
         closeModal();
       } catch (err) {
         const eb = modal.querySelector('#m-ch-error');
@@ -2576,6 +2702,7 @@ el('btn-server-menu').addEventListener('click', () => {
       <p class="desc">Codigo de convite: <strong style="letter-spacing:2px;" id="m-invite-code">${server.inviteCode}</strong> | O NexoBot responde a /ajuda no chat.</p>
       <div class="modal-actions" style="flex-direction:column;align-items:stretch;">
         <button class="btn-secondary" id="m-add-channel">+ Criar canal</button>
+        ${isMod ? '<button class="btn-secondary" id="m-server-icon">&#128444; Trocar icone do servidor</button>' : ''}
         ${isMod ? '<button class="btn-secondary" id="m-regen-invite">&#128257; Gerar novo codigo de convite</button>' : ''}
         <button class="btn-secondary" id="m-manage-roles">Gerenciar cargos</button>
         ${isMod ? '<button class="btn-secondary" id="m-bans">&#9940; Banimentos</button>' : ''}
@@ -2587,6 +2714,23 @@ el('btn-server-menu').addEventListener('click', () => {
       </div>`;
     modal.querySelector('#m-add-channel').addEventListener('click', () => el('btn-new-channel').click());
     modal.querySelector('#m-manage-roles').addEventListener('click', rolesManagerModal);
+    const iconBtn = modal.querySelector('#m-server-icon');
+    if (iconBtn) iconBtn.addEventListener('click', () => {
+      const fileInput = document.createElement('input');
+      fileInput.type = 'file';
+      fileInput.accept = 'image/png,image/jpeg,image/gif,image/webp';
+      fileInput.addEventListener('change', async () => {
+        const file = fileInput.files && fileInput.files[0];
+        if (!file) return;
+        try {
+          const blob = await fileToAvatarBlob(file);
+          const data = await API.post(`/api/servers/${server.id}/icon`, blob);
+          onServerUpdate(data.server);
+          closeModal();
+        } catch (err) { alert(err.message); }
+      });
+      fileInput.click();
+    });
     const regenBtn = modal.querySelector('#m-regen-invite');
     if (regenBtn) regenBtn.addEventListener('click', async () => {
       try {
