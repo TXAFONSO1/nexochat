@@ -331,6 +331,7 @@ function handleRealtime(event) {
     case 'member_leave': onMemberLeave(event); break;
     case 'channel_update': onChannelUpdate(event.channel); break;
     case 'server_update': onServerUpdate(event.server); break;
+    case 'poll_update': onPollUpdate(event); break;
     case 'channel_delete': onChannelDelete(event); break;
     case 'invite_regenerated': onInviteRegenerated(event); break;
     case 'server_deleted': onServerDeleted(event); break;
@@ -669,44 +670,117 @@ function renderSidebar() {
   renderChannels();
 }
 
+function collapsedCatKey(serverId) {
+  return 'nexo_cat_collapsed_' + serverId;
+}
+
+function getCollapsedCats(serverId) {
+  try {
+    const v = JSON.parse(localStorage.getItem(collapsedCatKey(serverId)) || '[]');
+    return Array.isArray(v) ? v : [];
+  } catch (err) {
+    return [];
+  }
+}
+
+function toggleCollapsedCat(serverId, catId) {
+  const list = getCollapsedCats(serverId);
+  const idx = list.indexOf(catId);
+  if (idx >= 0) list.splice(idx, 1);
+  else list.push(catId);
+  localStorage.setItem(collapsedCatKey(serverId), JSON.stringify(list));
+}
+
 function renderChannels() {
   const list = el('channel-list');
   list.innerHTML = '';
 
-  const textChannels = state.channels.filter(c => c.type !== 'voice');
-  const voiceChannels = state.channels.filter(c => c.type === 'voice');
+  const server = currentServer();
+  const categories = server && Array.isArray(server.categories)
+    ? [...server.categories].sort((a, b) => a.position - b.position)
+    : [];
 
-  const cat1 = document.createElement('div');
-  cat1.className = 'channel-category-inline';
-  cat1.textContent = 'CANAIS DE TEXTO';
-  list.appendChild(cat1);
-  for (const ch of textChannels) list.appendChild(channelItem(ch));
+  const uncategorized = state.channels.filter(c => !c.categoryId || !categories.some(k => k.id === c.categoryId));
+  const textChannels = uncategorized.filter(c => c.type !== 'voice');
+  const voiceChannels = uncategorized.filter(c => c.type === 'voice');
 
-  const cat2 = document.createElement('div');
-  cat2.className = 'channel-category-inline';
-  cat2.textContent = 'CANAIS DE VOZ';
-  list.appendChild(cat2);
-  for (const ch of voiceChannels) {
-    list.appendChild(channelItem(ch));
-    const roomUsers = state.voiceRooms.get(ch.id);
-    if (roomUsers) {
-      for (const u of roomUsers) {
-        const item = document.createElement('div');
-        item.className = 'voice-participant';
-        item.appendChild(avatarEl(u, 'avatar-sm'));
-        const name = document.createElement('span');
-        name.textContent = u.username;
-        item.appendChild(name);
-        list.appendChild(item);
-      }
+  if (textChannels.length) {
+    const cat1 = document.createElement('div');
+    cat1.className = 'channel-category-inline';
+    cat1.textContent = 'CANAIS DE TEXTO';
+    list.appendChild(cat1);
+    for (const ch of textChannels) list.appendChild(channelItem(ch));
+  }
+  if (voiceChannels.length) {
+    const cat2 = document.createElement('div');
+    cat2.className = 'channel-category-inline';
+    cat2.textContent = 'CANAIS DE VOZ';
+    list.appendChild(cat2);
+    for (const ch of voiceChannels) {
+      list.appendChild(channelItem(ch));
+      appendVoiceParticipants(list, ch.id);
     }
   }
 
-  if (!textChannels.length && !voiceChannels.length) {
+  const collapsed = getCollapsedCats(state.currentServerId);
+  for (const cat of categories) {
+    const header = document.createElement('div');
+    header.className = 'channel-category-inline cat-header';
+    const isCollapsed = collapsed.includes(cat.id);
+    header.innerHTML = `<span class="cat-chevron">${isCollapsed ? '&#9656;' : '&#9662;'}</span> ${escapeHtml(cat.name.toUpperCase())}`;
+    const delBtn = document.createElement('span');
+    delBtn.className = 'cat-del';
+    delBtn.textContent = 'x';
+    delBtn.title = 'Excluir categoria';
+    delBtn.addEventListener('click', async e => {
+      e.stopPropagation();
+      if (!confirm(`Excluir a categoria "${cat.name}"? Os canais voltam para o topo.`)) return;
+      try {
+        await apiErrorGuard(() => API.del(`/api/servers/${state.currentServerId}/categories/${cat.id}`));
+      } catch (err) { alert(err.message); }
+    });
+    if (canModerateClient(state.currentServerId)) header.appendChild(delBtn);
+    header.addEventListener('click', () => {
+      toggleCollapsedCat(state.currentServerId, cat.id);
+      renderChannels();
+    });
+    list.appendChild(header);
+
+    if (isCollapsed) continue;
+    const inCat = state.channels
+      .filter(c => c.categoryId === cat.id)
+      .sort((a, b) => a.position - b.position);
+    for (const ch of inCat) {
+      list.appendChild(channelItem(ch));
+      appendVoiceParticipants(list, ch.id);
+    }
+    if (!inCat.length) {
+      const empty = document.createElement('div');
+      empty.className = 'channel-category-inline cat-empty';
+      empty.textContent = '(vazio)';
+      list.appendChild(empty);
+    }
+  }
+
+  if (!textChannels.length && !voiceChannels.length && !categories.length) {
     const empty = document.createElement('div');
     empty.className = 'channel-category-inline';
     empty.textContent = 'Nenhum canal ainda';
     list.appendChild(empty);
+  }
+}
+
+function appendVoiceParticipants(list, channelId) {
+  const roomUsers = state.voiceRooms.get(channelId);
+  if (!roomUsers) return;
+  for (const u of roomUsers) {
+    const item = document.createElement('div');
+    item.className = 'voice-participant';
+    item.appendChild(avatarEl(u, 'avatar-sm'));
+    const name = document.createElement('span');
+    name.textContent = u.username;
+    item.appendChild(name);
+    list.appendChild(item);
   }
 }
 
@@ -1051,6 +1125,7 @@ function updateChatHeader(channel, dmPeer) {
     el('channel-name').appendChild(tagSpan(dmPeer));
     el('channel-topic').textContent = dmPeer.isBot ? 'Bot' : 'Mensagem direta';
     el('message-input').disabled = false;
+    el('btn-poll').hidden = true;
     el('message-input').placeholder = `Conversar com @${dmPeer.username}`;
     return;
   }
@@ -1059,6 +1134,7 @@ function updateChatHeader(channel, dmPeer) {
     el('channel-name').textContent = state.homeMode ? 'Suas conversas' : 'Nenhum canal';
     el('channel-topic').textContent = state.homeMode ? 'Amigos e mensagens diretas' : '';
     el('message-input').disabled = true;
+    el('btn-poll').hidden = true;
     el('message-input').placeholder = state.homeMode ? 'Selecione um amigo ou conversa' : 'Selecione um canal';
     return;
   }
@@ -1069,6 +1145,7 @@ function updateChatHeader(channel, dmPeer) {
     ? 'Canal de voz - chat de texto abaixo'
     : (channel.topic || `Bem-vindo ao #${channel.name}`);
   el('message-input').disabled = false;
+  el('btn-poll').hidden = isVoice;
   el('message-input').placeholder = isVoice ? `Chat do canal ${channel.name}` : `Conversar em #${channel.name}`;
 }
 
@@ -1143,6 +1220,8 @@ function insertEmojiAtCursor(em) {
 
 el('btn-emoji').addEventListener('click', () => emojiPicker(insertEmojiAtCursor));
 
+el('btn-poll').addEventListener('click', pollModal);
+
 function findKnownUser(username) {
   const lower = username.toLowerCase();
   const m = state.members.find(x => x.username.toLowerCase() === lower);
@@ -1171,6 +1250,53 @@ function contentWithMentions(text) {
   }
   frag.appendChild(document.createTextNode(text.slice(last)));
   return frag;
+}
+
+function pollEl(msg) {
+  const box = document.createElement('div');
+  box.className = 'poll-box';
+  const q = document.createElement('div');
+  q.className = 'poll-question';
+  q.textContent = msg.poll.question;
+  box.appendChild(q);
+  const votes = msg.poll.votes || {};
+  const total = Object.keys(votes).length;
+  for (let i = 0; i < msg.poll.options.length; i++) {
+    const optText = msg.poll.options[i];
+    const count = Object.values(votes).filter(v => v === i).length;
+    const pct = total ? Math.round((count / total) * 100) : 0;
+    const mine = votes[state.me.id] === i;
+    const btn = document.createElement('button');
+    btn.className = 'poll-option' + (mine ? ' mine' : '');
+    const labelRow = document.createElement('div');
+    labelRow.className = 'poll-option-label';
+    labelRow.innerHTML = `<span>${mine ? '&#10003; ' : ''}${escapeHtml(optText)}</span><span class="pct">${pct}%</span>`;
+    btn.appendChild(labelRow);
+    const bar = document.createElement('div');
+    bar.className = 'poll-bar';
+    const fill = document.createElement('div');
+    fill.className = 'poll-fill';
+    fill.style.width = pct + '%';
+    bar.appendChild(fill);
+    btn.appendChild(bar);
+    const countSpan = document.createElement('span');
+    countSpan.className = 'poll-count';
+    countSpan.textContent = `${count} ${count === 1 ? 'voto' : 'votos'}`;
+    btn.appendChild(countSpan);
+    btn.addEventListener('click', async () => {
+      try {
+        await apiErrorGuard(() => API.post(`/api/messages/${msg.id}/vote`, { option: i }));
+      } catch (err) {
+        alert(err.message);
+      }
+    });
+    box.appendChild(btn);
+  }
+  const foot = document.createElement('div');
+  foot.className = 'poll-total';
+  foot.textContent = `${total} ${total === 1 ? 'voto' : 'votos'} - clique para votar, clique de novo para retirar`;
+  box.appendChild(foot);
+  return box;
 }
 
 function reactionsEl(msg) {
@@ -1348,6 +1474,10 @@ function messageEl(msg, grouped) {
     body.appendChild(meta);
   }
 
+  if (msg.poll) {
+    body.appendChild(pollEl(msg));
+  }
+
   if (msg.content) {
     const content = document.createElement('div');
     content.className = 'message-content';
@@ -1391,7 +1521,7 @@ function renderMessages() {
   let prevUser = null;
   let prevTime = 0;
   for (const msg of state.messages) {
-    const grouped = prevUser === msg.userId && msg.createdAt - prevTime < 5 * 60 * 1000;
+    const grouped = !msg.poll && prevUser === msg.userId && msg.createdAt - prevTime < 5 * 60 * 1000;
     box.appendChild(messageEl(msg, grouped));
     prevUser = msg.userId;
     prevTime = msg.createdAt;
@@ -1560,6 +1690,14 @@ function onServerUpdate(server) {
   if (idx >= 0) state.servers[idx] = { ...state.servers[idx], ...server };
   else state.servers.push(server);
   renderRail();
+  if (!state.homeMode && state.currentServerId === server.id) renderSidebar();
+}
+
+function onPollUpdate(event) {
+  const msg = state.messages.find(m => m.id === event.messageId);
+  if (!msg || !msg.poll) return;
+  msg.poll.votes = event.votes || {};
+  renderMessages();
 }
 
 function onVoiceState(event) {
@@ -2614,11 +2752,18 @@ function jumpToMessage(messageId) {
 function channelManageModal(ch) {
   if (state.homeMode || !canModerateClient(state.currentServerId)) return;
   showModal(modal => {
+    const cats = (currentServer() && Array.isArray(currentServer().categories)) ? currentServer().categories : [];
     modal.innerHTML = `
       <h2>#${escapeHtml(ch.name)}</h2>
       <label>Novo nome
         <input type="text" id="m-ch-name" maxlength="32" value="${escapeHtml(ch.name)}">
       </label>
+      ${cats.length ? `<label>Categoria
+        <select id="m-ch-cat">
+          <option value="">Sem categoria</option>
+          ${cats.map(k => `<option value="${k.id}" ${ch.categoryId === k.id ? 'selected' : ''}>${escapeHtml(k.name)}</option>`).join('')}
+        </select>
+      </label>` : ''}
       ${ch.type !== 'voice' ? `<label>Topico do canal
         <input type="text" id="m-ch-topic" maxlength="200" value="${escapeHtml(ch.topic || '')}" placeholder="Ex: Conversa geral da galera">
       </label>` : ''}
@@ -2635,6 +2780,8 @@ function channelManageModal(ch) {
         const payload = { name: modal.querySelector('#m-ch-name').value };
         const topicInput = modal.querySelector('#m-ch-topic');
         if (topicInput) payload.topic = topicInput.value;
+        const catSelect = modal.querySelector('#m-ch-cat');
+        if (catSelect) payload.categoryId = catSelect.value || null;
         await API.patch(`/api/channels/${ch.id}`, payload);
         closeModal();
       } catch (err) {
@@ -2649,6 +2796,74 @@ function channelManageModal(ch) {
         await API.del(`/api/channels/${ch.id}`);
         closeModal();
       } catch (err) { alert(err.message); }
+    });
+  });
+}
+
+function createCategoryModal() {
+  if (state.homeMode || !canModerateClient(state.currentServerId)) return;
+  showModal(modal => {
+    modal.innerHTML = `
+      <h2>Nova categoria</h2>
+      <p class="desc">Categorias agrupam canais na barra lateral e podem ser colapsadas.</p>
+      <label>Nome
+        <input type="text" id="m-cat-name" maxlength="24" placeholder="Ex: GERAL, JOGOS, ESTUDOS">
+      </label>
+      <div class="auth-error hidden" id="m-cat-error"></div>
+      <div class="modal-actions">
+        <button class="btn-secondary" id="m-cancel">Cancelar</button>
+        <button class="btn-primary" id="m-create-cat" style="padding:10px 16px;border-radius:6px;">Criar</button>
+      </div>`;
+    const nameInput = modal.querySelector('#m-cat-name');
+    nameInput.focus();
+    const submit = async () => {
+      try {
+        await apiErrorGuard(() => API.post(`/api/servers/${state.currentServerId}/categories`, { name: nameInput.value }));
+        closeModal();
+      } catch (err) {
+        const eb = modal.querySelector('#m-cat-error');
+        eb.textContent = err.message;
+        eb.classList.remove('hidden');
+      }
+    };
+    modal.querySelector('#m-create-cat').addEventListener('click', submit);
+    nameInput.addEventListener('keydown', e => { if (e.key === 'Enter') submit(); });
+    modal.querySelector('#m-cancel').addEventListener('click', closeModal);
+  });
+}
+
+function pollModal() {
+  if (state.homeMode || !state.currentChannelId) return;
+  const channel = state.channels.find(c => c.id === state.currentChannelId);
+  if (!channel || channel.type === 'voice') return;
+  showModal(modal => {
+    modal.innerHTML = `
+      <h2>&#128202; Criar enquete</h2>
+      <p class="desc">Pergunta com ate 200 caracteres. Opcoes: uma por linha, de 2 a 10.</p>
+      <label>Pergunta
+        <input type="text" id="m-poll-q" maxlength="200" placeholder="Ex: Dia do jogo?">
+      </label>
+      <label>Opcoes (uma por linha)
+        <textarea id="m-poll-o" rows="5" placeholder="Sabado&#10;Domingo"></textarea>
+      </label>
+      <div class="auth-error hidden" id="m-poll-error"></div>
+      <div class="modal-actions">
+        <button class="btn-secondary" id="m-cancel">Cancelar</button>
+        <button class="btn-primary" id="m-send-poll" style="padding:10px 16px;border-radius:6px;">Enviar enquete</button>
+      </div>`;
+    modal.querySelector('#m-poll-q').focus();
+    modal.querySelector('#m-cancel').addEventListener('click', closeModal);
+    modal.querySelector('#m-send-poll').addEventListener('click', async () => {
+      const question = modal.querySelector('#m-poll-q').value.trim();
+      const options = modal.querySelector('#m-poll-o').value.split('\n').map(o => o.trim()).filter(Boolean);
+      try {
+        await apiErrorGuard(() => API.post(`/api/channels/${state.currentChannelId}/poll`, { question, options }));
+        closeModal();
+      } catch (err) {
+        const eb = modal.querySelector('#m-poll-error');
+        eb.textContent = err.message;
+        eb.classList.remove('hidden');
+      }
     });
   });
 }
@@ -2702,6 +2917,7 @@ el('btn-server-menu').addEventListener('click', () => {
       <p class="desc">Codigo de convite: <strong style="letter-spacing:2px;" id="m-invite-code">${server.inviteCode}</strong> | O NexoBot responde a /ajuda no chat.</p>
       <div class="modal-actions" style="flex-direction:column;align-items:stretch;">
         <button class="btn-secondary" id="m-add-channel">+ Criar canal</button>
+        ${isMod ? '<button class="btn-secondary" id="m-add-category">+ Criar categoria</button>' : ''}
         ${isMod ? '<button class="btn-secondary" id="m-server-icon">&#128444; Trocar icone do servidor</button>' : ''}
         ${isMod ? '<button class="btn-secondary" id="m-regen-invite">&#128257; Gerar novo codigo de convite</button>' : ''}
         <button class="btn-secondary" id="m-manage-roles">Gerenciar cargos</button>
@@ -2713,6 +2929,8 @@ el('btn-server-menu').addEventListener('click', () => {
         <button class="btn-secondary" id="m-close">Fechar</button>
       </div>`;
     modal.querySelector('#m-add-channel').addEventListener('click', () => el('btn-new-channel').click());
+    const addCatBtn = modal.querySelector('#m-add-category');
+    if (addCatBtn) addCatBtn.addEventListener('click', createCategoryModal);
     modal.querySelector('#m-manage-roles').addEventListener('click', rolesManagerModal);
     const iconBtn = modal.querySelector('#m-server-icon');
     if (iconBtn) iconBtn.addEventListener('click', () => {

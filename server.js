@@ -162,7 +162,8 @@ function publicServer(s) {
     inviteCode: s.inviteCode,
     ownerId: s.ownerId,
     createdAt: s.createdAt,
-    iconUrl: s.iconFile ? `/api/server-icons/${s.id}?v=${s.iconV || 0}` : null
+    iconUrl: s.iconFile ? `/api/server-icons/${s.id}?v=${s.iconV || 0}` : null,
+    categories: Array.isArray(s.categories) ? s.categories : []
   };
 }
 
@@ -673,6 +674,38 @@ async function handleApi(req, res, url) {
     return json(res, 200, { server: publicServer(server) });
   }
 
+  match = url.pathname.match(/^\/api\/servers\/([a-z0-9]+)\/categories$/);
+  if (match && req.method === 'POST') {
+    const server = store.db.servers.find(s => s.id === match[1]);
+    if (!server || !canModerate(server.id, me.id)) return json(res, 403, { error: 'Sem permissao' });
+    if (!Array.isArray(server.categories)) server.categories = [];
+    const name = String(body.name || '').trim().slice(0, 24);
+    if (name.length < 2) return json(res, 400, { error: 'Nome da categoria muito curto' });
+    if (server.categories.length >= 20) return json(res, 400, { error: 'Maximo de 20 categorias' });
+    const category = { id: genId(), name, position: server.categories.length };
+    server.categories.push(category);
+    store.save();
+    broadcastServer(server.id, { type: 'server_update', server: publicServer(server) });
+    return json(res, 201, { category });
+  }
+
+  match = url.pathname.match(/^\/api\/servers\/([a-z0-9]+)\/categories\/([a-z0-9]+)$/);
+  if (match && req.method === 'DELETE') {
+    const server = store.db.servers.find(s => s.id === match[1]);
+    if (!server || !canModerate(server.id, me.id)) return json(res, 403, { error: 'Sem permissao' });
+    const before = (server.categories || []).length;
+    server.categories = (server.categories || []).filter(c => c.id !== match[2]);
+    if (server.categories.length === before) return json(res, 404, { error: 'Categoria nao encontrada' });
+    const affected = store.db.channels.filter(c => c.serverId === server.id && c.categoryId === match[2]);
+    for (const ch of affected) {
+      ch.categoryId = null;
+      broadcastServer(server.id, { type: 'channel_update', channel: ch });
+    }
+    store.save();
+    broadcastServer(server.id, { type: 'server_update', server: publicServer(server) });
+    return json(res, 200, { ok: true });
+  }
+
   if (route === 'POST /api/logout') {
     delete store.db.sessions[tokenFromReq(req)];
     store.save();
@@ -735,7 +768,13 @@ async function handleApi(req, res, url) {
       return json(res, 400, { error: 'Nome de canal invalido (letras minusculas, numeros e hifen)' });
     }
     const position = store.db.channels.filter(c => c.serverId === serverId && c.type === type).length;
-    const channel = { id: genId(), serverId, name, position, type };
+    const channel = { id: genId(), serverId, name, position, type, categoryId: null };
+    if (body.categoryId) {
+      const server = store.db.servers.find(s => s.id === serverId);
+      if (Array.isArray(server.categories) && server.categories.some(c => c.id === body.categoryId)) {
+        channel.categoryId = body.categoryId;
+      }
+    }
     store.db.channels.push(channel);
     store.save();
     broadcastServer(serverId, { type: 'channel_create', channel });
@@ -887,6 +926,17 @@ async function handleApi(req, res, url) {
       channel.topic = body.topic.trim().slice(0, 200);
       changed = true;
     }
+    if (body.categoryId !== undefined) {
+      const server = store.db.servers.find(s => s.id === channel.serverId);
+      const cats = Array.isArray(server.categories) ? server.categories : [];
+      if (body.categoryId === null) {
+        channel.categoryId = null;
+        changed = true;
+      } else if (cats.some(c => c.id === body.categoryId)) {
+        channel.categoryId = body.categoryId;
+        changed = true;
+      }
+    }
     if (!changed) return json(res, 400, { error: 'Nada para atualizar' });
     store.save();
     broadcastServer(channel.serverId, { type: 'channel_update', channel });
@@ -940,6 +990,74 @@ async function handleApi(req, res, url) {
     if (!message) return json(res, 400, { error: 'Falha ao enviar' });
     handleBotCommands(message);
     return json(res, 201, { message });
+  }
+
+  match = url.pathname.match(/^\/api\/channels\/([a-z0-9]+)\/poll$/);
+  if (match && req.method === 'POST') {
+    const channelId = match[1];
+    const channel = store.db.channels.find(c => c.id === channelId);
+    if (!channel || !isMember(channel.serverId, me.id)) return json(res, 403, { error: 'Sem acesso' });
+    if (channel.type === 'voice') return json(res, 400, { error: 'Enquetes sao apenas em canais de texto' });
+    const question = String(body.question || '').trim().slice(0, 200);
+    const optsRaw = Array.isArray(body.options) ? body.options : [];
+    const options = optsRaw.map(o => String(o || '').trim().slice(0, 60)).filter(Boolean);
+    if (!question) return json(res, 400, { error: 'A enquete precisa de uma pergunta' });
+    if (options.length < 2) return json(res, 400, { error: 'A enquete precisa de pelo menos 2 opcoes' });
+    if (options.length > 10) return json(res, 400, { error: 'Maximo de 10 opcoes' });
+    const message = {
+      id: genId(),
+      channelId,
+      serverId: channel.serverId,
+      userId: me.id,
+      username: me.username,
+      color: me.color,
+      isBot: false,
+      content: '',
+      attachments: [],
+      replyTo: null,
+      poll: { question, options, votes: {} },
+      reactions: {},
+      editedAt: null,
+      pinned: false,
+      mentionIds: [],
+      createdAt: Date.now()
+    };
+    store.db.messages.push(message);
+    store.save();
+    broadcastServer(channel.serverId, { type: 'message', message });
+    return json(res, 201, { message });
+  }
+
+  match = url.pathname.match(/^\/api\/messages\/([a-z0-9]+)\/vote$/);
+  if (match && req.method === 'POST') {
+    const message = store.db.messages.find(m => m.id === match[1]);
+    if (!message || !message.poll) return json(res, 404, { error: 'Enquete nao encontrada' });
+    const option = parseInt(body.option);
+    if (!(option >= 0 && option < message.poll.options.length)) return json(res, 400, { error: 'Opcao invalida' });
+    if (message.channelId.startsWith('dm_')) {
+      const parts = message.channelId.split('_');
+      if (me.id !== parts[1] && me.id !== parts[2]) return json(res, 403, { error: 'Sem acesso' });
+    } else {
+      const channel = store.db.channels.find(c => c.id === message.channelId);
+      if (!channel || !isMember(channel.serverId, me.id)) return json(res, 403, { error: 'Sem acesso' });
+      const now = Date.now();
+      if (lastVoteAt.get(me.id) && now - lastVoteAt.get(me.id) < 120) {
+        return json(res, 429, { error: 'Muito rapido' });
+      }
+      lastVoteAt.set(me.id, now);
+    }
+    if (message.poll.votes[me.id] === option) delete message.poll.votes[me.id];
+    else message.poll.votes[me.id] = option;
+    store.save();
+    const event = { type: 'poll_update', messageId: message.id, channelId: message.channelId, votes: message.poll.votes };
+    if (message.channelId.startsWith('dm_')) {
+      const parts = message.channelId.split('_');
+      sendToUser(parts[1], event);
+      sendToUser(parts[2], event);
+    } else {
+      broadcastServer(store.db.channels.find(c => c.id === message.channelId).serverId, event);
+    }
+    return json(res, 200, { votes: message.poll.votes });
   }
 
   match = url.pathname.match(/^\/api\/typing$/);
@@ -1332,6 +1450,7 @@ async function handleApi(req, res, url) {
 
 const lastMessageAt = new Map();
 const lastTypingAt = new Map();
+const lastVoteAt = new Map();
 
 function serveFileFromDisk(res, filePath, downloadName) {
   fs.readFile(filePath, (err, data) => {
@@ -1423,6 +1542,7 @@ function migrate() {
   for (const s of store.db.servers) {
     if (!s.bans) { s.bans = []; changed = true; }
     if (s.iconFile === undefined) { s.iconFile = null; s.iconV = 0; changed = true; }
+    if (!Array.isArray(s.categories)) { s.categories = []; changed = true; }
   }
   for (const c of store.db.channels) {
     if (c.topic === undefined) { c.topic = ''; changed = true; }
