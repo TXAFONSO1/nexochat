@@ -40,7 +40,8 @@ const state = {
   incomingReqs: [],
   outgoingReqs: [],
   voiceRooms: new Map(),
-  pendingAttachments: []
+  pendingAttachments: [],
+  unreadChannels: new Map()
 };
 
 const el = id => document.getElementById(id);
@@ -51,11 +52,42 @@ function initials(name) {
   return name.trim().charAt(0).toUpperCase() || '?';
 }
 
+const STATUS_META = {
+  online: { color: '#3ba55d', label: 'Online' },
+  idle: { color: '#faa61a', label: 'Ausente' },
+  dnd: { color: '#ed4245', label: 'Nao perturbe' },
+  invisible: { color: '#747f8d', label: 'Invisivel' },
+  offline: { color: '#747f8d', label: 'Offline' }
+};
+
+function statusDot(user, cls = '') {
+  const connected = user.online !== undefined ? user.online : true;
+  const st = !connected ? 'offline' : (STATUS_META[user.status] ? user.status : 'online');
+  const dot = document.createElement('span');
+  dot.className = 'presence-dot status-' + st + ' ' + cls;
+  dot.style.background = STATUS_META[st].color;
+  const txt = STATUS_META[st].label + (user.statusText ? ` - ${user.statusText}` : '');
+  dot.title = txt;
+  return dot;
+}
+
 function avatarEl(user, cls = '') {
   const div = document.createElement('div');
   div.className = `avatar ${cls}`;
-  div.style.background = user.color;
-  div.textContent = initials(user.username);
+  div.style.background = user.color || '#5865f2';
+  if (user.avatarUrl) {
+    const img = document.createElement('img');
+    img.src = user.avatarUrl;
+    img.alt = '';
+    img.loading = 'lazy';
+    img.addEventListener('error', () => {
+      img.remove();
+      if (!div.textContent) div.textContent = initials(user.username || '?');
+    });
+    div.appendChild(img);
+  } else {
+    div.textContent = initials(user.username || '?');
+  }
   return div;
 }
 
@@ -288,7 +320,94 @@ function handleRealtime(event) {
     case 'friend_request': onFriendRequest(event); break;
     case 'friend_accept': loadFriends(); playPing(); break;
     case 'friend_update': loadFriends(); break;
+    case 'pins_update': onPinsUpdate(event); break;
+    case 'presence_status': onPresenceStatus(event); break;
+    case 'member_leave': onMemberLeave(event); break;
+    case 'channel_update': onChannelUpdate(event.channel); break;
+    case 'channel_delete': onChannelDelete(event); break;
+    case 'invite_regenerated': onInviteRegenerated(event); break;
+    case 'server_deleted': onServerDeleted(event); break;
+    case 'you_were_kicked': onYouRemoved(event, 'Voce foi expulso do servidor', event.serverName); break;
+    case 'you_were_banned': onYouRemoved(event, 'Voce foi banido do servidor', event.serverName); break;
   }
+}
+
+function onPinsUpdate(event) {
+  const msg = state.messages.find(m => m.id === event.messageId);
+  if (msg) {
+    msg.pinned = event.pinned;
+    if (messageVisibleNow(msg)) renderMessages();
+  }
+}
+
+function onPresenceStatus(event) {
+  if (event.userId === state.me.id) return;
+  const member = state.members.find(m => m.id === event.userId);
+  if (member) {
+    member.status = event.status;
+    member.statusText = event.statusText;
+    renderMembers();
+  }
+  const conv = state.dms.find(d => d.partner.id === event.userId);
+  if (conv) {
+    conv.partner.status = event.status;
+    conv.partner.statusText = event.statusText;
+    if (state.homeMode) renderSidebar();
+  }
+}
+
+function refreshServers() {
+  return API.get('/api/me').then(data => {
+    state.servers = data.servers || [];
+    renderRail();
+  }).catch(() => {});
+}
+
+function onMemberLeave(event) {
+  if (event.serverId !== state.currentServerId) return;
+  state.members = state.members.filter(m => m.id !== event.userId);
+  renderMembers();
+}
+
+function onChannelUpdate(channel) {
+  if (!channel || channel.serverId !== state.currentServerId) return;
+  const idx = state.channels.findIndex(c => c.id === channel.id);
+  if (idx >= 0) state.channels[idx] = channel;
+  renderSidebar();
+  if (state.currentChannelId === channel.id) updateChatHeader(channel, null);
+}
+
+function onChannelDelete(event) {
+  if (event.serverId !== state.currentServerId) return;
+  state.channels = state.channels.filter(c => c.id !== event.channelId);
+  if (state.currentChannelId === event.channelId) {
+    const firstText = state.channels.find(c => c.type !== 'voice');
+    if (firstText) selectChannel(firstText.id);
+    else { state.messages = []; renderMessages(); updateChatHeader(null, null); }
+  }
+  renderSidebar();
+}
+
+function onInviteRegenerated(event) {
+  if (event.serverId !== state.currentServerId) return;
+  const server = currentServer();
+  if (server) server.inviteCode = event.inviteCode;
+}
+
+function onServerDeleted(event) {
+  const wasCurrent = event.serverId === state.currentServerId;
+  state.servers = state.servers.filter(s => s.id !== event.serverId);
+  renderRail();
+  if (wasCurrent) selectHome();
+  alert(`O servidor "${event.serverName}" foi excluido pelo dono.`);
+}
+
+function onYouRemoved(event, message, serverName) {
+  alert(`${message} "${serverName}".`);
+  refreshServers().then(() => {
+    if (!state.homeMode && !currentServer()) selectHome();
+    else if (event.serverId === state.currentServerId) selectHome();
+  });
 }
 
 function currentServer() {
@@ -370,8 +489,27 @@ function tagSpan(u) {
 }
 
 function renderUserPanel() {
-  el('me-avatar').style.background = state.me.color;
-  el('me-avatar').textContent = initials(state.me.username);
+  const av = el('me-avatar');
+  av.innerHTML = '';
+  av.style.background = state.me.color;
+  if (state.me.avatarUrl) {
+    const img = document.createElement('img');
+    img.src = state.me.avatarUrl + (state.me.avatarUrl.includes('?') ? '&' : '?') + 't=' + Date.now();
+    img.alt = '';
+    av.appendChild(img);
+  } else {
+    av.textContent = initials(state.me.username);
+  }
+  const st = STATUS_META[state.me.status] ? state.me.status : 'online';
+  let dot = av.querySelector('.me-status-dot');
+  if (!dot) {
+    dot = document.createElement('span');
+    dot.className = 'presence-dot me-status-dot';
+    av.appendChild(dot);
+  }
+  dot.className = 'presence-dot me-status-dot status-' + st;
+  dot.style.background = STATUS_META[st].color;
+  dot.title = STATUS_META[st].label + (state.me.statusText ? ` - ${state.me.statusText}` : '');
   el('me-name').textContent = state.me.username;
   el('me-handle').textContent = handleOf(state.me);
 }
@@ -445,6 +583,7 @@ function updateHeaderButtons() {
   el('btn-new-channel').classList.toggle('hidden', isHome);
   el('btn-invite').classList.toggle('hidden', isHome);
   el('btn-server-menu').classList.toggle('hidden', isHome);
+  el('btn-search').classList.toggle('hidden', isHome);
 }
 
 async function refreshMembers() {
@@ -563,6 +702,27 @@ function channelItem(ch) {
   const label = document.createElement('span');
   label.textContent = ch.name;
   btn.appendChild(label);
+  if (!isVoice) {
+    const unread = state.unreadChannels.get(ch.id) || 0;
+    if (unread > 0) {
+      const badge = document.createElement('span');
+      badge.className = 'unread-badge';
+      badge.textContent = unread;
+      btn.appendChild(badge);
+      btn.classList.add('has-unread');
+    }
+    if (!state.homeMode && canModerateClient(state.currentServerId)) {
+      const gear = document.createElement('span');
+      gear.className = 'channel-gear';
+      gear.innerHTML = '&#9881;';
+      gear.title = 'Editar / excluir canal';
+      gear.addEventListener('click', e => {
+        e.stopPropagation();
+        channelManageModal(ch);
+      });
+      btn.appendChild(gear);
+    }
+  }
   if (isVoice) {
     const roomUsers = state.voiceRooms.get(ch.id);
     if (roomUsers && roomUsers.length) {
@@ -713,16 +873,16 @@ function requestRow(req) {
 function friendRow(friend) {
   const item = document.createElement('button');
   item.className = 'friend-row clickable';
-  const dot = document.createElement('span');
-  dot.className = 'presence-dot' + (friend.online ? ' online' : '');
-  dot.title = friend.online ? 'Online' : 'Offline';
-  item.appendChild(dot);
+  item.appendChild(statusDot(friend));
   item.appendChild(avatarEl(friend, 'avatar-sm'));
   const nm = document.createElement('span');
   nm.className = 'friend-name';
   nm.textContent = friend.username;
   nm.appendChild(tagSpan(friend));
-  nm.style.color = friend.online ? friend.color : 'var(--text-muted)';
+  const connected = !!friend.online;
+  const stKey = !connected ? 'offline' : (STATUS_META[friend.status] ? friend.status : 'online');
+  nm.style.color = connected ? friend.color : 'var(--text-muted)';
+  if (friend.statusText) nm.title = STATUS_META[stKey].label + ' - ' + friend.statusText;
   item.appendChild(nm);
 
   const rm = document.createElement('button');
@@ -846,6 +1006,7 @@ async function selectChannel(channelId, keepVoice) {
   state.currentChannelId = channelId;
   state.typing.clear();
   renderTyping();
+  state.unreadChannels.delete(channelId);
   renderChannels();
   const channel = state.channels.find(c => c.id === channelId);
   updateChatHeader(channel, null);
@@ -1032,6 +1193,18 @@ function messageActions(msg) {
 
   mkBtn('&#128512;', 'Reagir', () => emojiPicker(em => toggleReaction(msg, em), true));
 
+  const canPin = msg.userId === state.me.id ||
+    (!state.homeMode && msg.serverId && canModerateClient(msg.serverId));
+  if (canPin) {
+    mkBtn('&#128204;', msg.pinned ? 'Desafixar' : 'Fixar mensagem', async () => {
+      try {
+        await apiErrorGuard(() => API.post(`/api/messages/${msg.id}/pin`));
+      } catch (err) {
+        alert(err.message);
+      }
+    });
+  }
+
   if (msg.userId === state.me.id) {
     mkBtn('&#9999;', 'Editar', () => startEditMessage(msg));
   }
@@ -1095,8 +1268,16 @@ function startEditMessage(msg) {
 
 function messageEl(msg, grouped) {
   const row = document.createElement('div');
-  row.className = 'message' + (grouped ? ' grouped' : '');
+  row.className = 'message' + (grouped ? ' grouped' : '') + (msg.pinned ? ' pinned-msg' : '');
   row.dataset.id = msg.id;
+
+  if (msg.pinned) {
+    const flag = document.createElement('span');
+    flag.className = 'pin-flag';
+    flag.innerHTML = '&#128204;';
+    flag.title = 'Mensagem fixada';
+    row.appendChild(flag);
+  }
 
   const body = document.createElement('div');
   body.className = 'message-body';
@@ -1212,11 +1393,20 @@ function notifyForMessage(msg, forcePing) {
 function onMessage(message) {
   if (message.serverId !== state.currentServerId || state.homeMode) {
     state.unreadServers.add(message.serverId);
+    if (message.userId !== state.me.id) {
+      state.unreadChannels.set(message.channelId, (state.unreadChannels.get(message.channelId) || 0) + 1);
+    }
     renderRail();
     notifyForMessage(message, false);
     return;
   }
-  if (message.channelId !== state.currentChannelId) return;
+  if (message.channelId !== state.currentChannelId) {
+    if (message.userId !== state.me.id) {
+      state.unreadChannels.set(message.channelId, (state.unreadChannels.get(message.channelId) || 0) + 1);
+      renderChannels();
+    }
+    return;
+  }
   appendMessageLive(message);
   clearTyping(message.userId);
   notifyForMessage(message, false);
@@ -1276,10 +1466,14 @@ function onTyping(event) {
 }
 
 function onPresence(event) {
+  const member = state.members.find(m => m.id === event.userId);
+  if (member) {
+    member.status = event.status || member.status;
+    member.statusText = event.statusText || '';
+  } else if (event.online) {
+    state.members.push({ id: event.userId, username: event.username, tag: null, color: event.color, status: 'online', statusText: '' });
+  }
   if (event.online) {
-    if (!state.members.some(m => m.id === event.userId)) {
-      state.members.push({ id: event.userId, username: event.username, tag: event.user?.tag || null, color: event.color });
-    }
     state.onlineIds.add(event.userId);
   } else {
     state.onlineIds.delete(event.userId);
@@ -1400,8 +1594,16 @@ function memberModal(member) {
     if (member.isBot) info.appendChild(botTag());
     const statusLine = document.createElement('div');
     statusLine.className = 'member-modal-status';
-    statusLine.textContent = state.onlineIds.has(member.id) ? 'Online' : 'Offline';
+    const isConnectedHere = state.onlineIds.has(member.id);
+    const stKey = !isConnectedHere ? 'offline' : (STATUS_META[member.status] ? member.status : 'online');
+    statusLine.textContent = STATUS_META[stKey].label + (member.statusText ? ` - ${member.statusText}` : '');
     info.appendChild(statusLine);
+    if (member.bio) {
+      const bioP = document.createElement('div');
+      bioP.className = 'member-modal-bio';
+      bioP.textContent = member.bio;
+      info.appendChild(bioP);
+    }
     if (member.tag && !member.isBot) {
       const handleBtn = document.createElement('button');
       handleBtn.className = 'member-modal-handle';
@@ -1431,6 +1633,33 @@ function memberModal(member) {
         openDmFromAnywhere(member.id);
       });
       actions.appendChild(dmBtn);
+    }
+
+    const server = currentServer();
+    if (mod && server && member.id !== state.me.id && server.ownerId !== member.id && !member.isBot) {
+      const kickBtn = document.createElement('button');
+      kickBtn.className = 'btn-secondary btn-danger-text';
+      kickBtn.innerHTML = '&#128296; Expulsar do servidor';
+      kickBtn.addEventListener('click', async () => {
+        if (!confirm(`Expulsar ${member.username} do servidor?`)) return;
+        try {
+          await API.post(`/api/servers/${state.currentServerId}/members/${member.id}/kick`);
+          closeModal();
+        } catch (err) { alert(err.message); }
+      });
+      actions.appendChild(kickBtn);
+      const banBtn = document.createElement('button');
+      banBtn.className = 'btn-secondary btn-danger-text';
+      banBtn.innerHTML = '&#9940; Banir do servidor';
+      banBtn.addEventListener('click', async () => {
+        const reason = prompt(`Banir ${member.username}. Motivo (opcional):`) ;
+        if (reason === null) return;
+        try {
+          await API.post(`/api/servers/${state.currentServerId}/members/${member.id}/ban`, { reason });
+          closeModal();
+        } catch (err) { alert(err.message); }
+      });
+      actions.appendChild(banBtn);
     }
     m.appendChild(actions);
 
@@ -2018,24 +2247,373 @@ function newDmModal() {
   });
 }
 
+function fileToAvatarBlob(file) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    const url = URL.createObjectURL(file);
+    img.onload = () => {
+      const size = 256;
+      const canvas = document.createElement('canvas');
+      canvas.width = size;
+      canvas.height = size;
+      const ctx = canvas.getContext('2d');
+      const side = Math.min(img.width, img.height);
+      ctx.drawImage(img, (img.width - side) / 2, (img.height - side) / 2, side, side, 0, 0, size, size);
+      URL.revokeObjectURL(url);
+      canvas.toBlob(b => b ? resolve(b) : reject(new Error('Falha ao processar imagem')), 'image/png');
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('Imagem invalida')); };
+    img.src = url;
+  });
+}
+
+function myProfileModal() {
+  showModal(modal => {
+    modal.innerHTML = `
+      <h2>Meu perfil</h2>
+      <div class="profile-head">
+        <div class="avatar" id="m-av-preview"></div>
+        <div class="profile-head-info">
+          <strong>${escapeHtml(state.me.username)}</strong><span class="user-tag">#${state.me.tag || ''}</span>
+          <button class="btn-secondary btn-sm" id="m-av-change">Trocar avatar</button>
+          <input type="file" id="m-av-file" accept="image/png,image/jpeg,image/gif,image/webp" hidden>
+        </div>
+      </div>
+      <label>Status</label>
+      <div class="status-options" id="m-status-options"></div>
+      <label>Status personalizado
+        <input type="text" id="m-statustext" maxlength="128" placeholder="O que voce esta fazendo?" value="${escapeHtml(state.me.statusText || '')}">
+      </label>
+      <label>Sobre mim
+        <textarea id="m-bio" maxlength="200" rows="3" placeholder="Conte algo sobre voce...">${escapeHtml(state.me.bio || '')}</textarea>
+      </label>
+      <div class="auth-error hidden" id="m-profile-error"></div>
+      <div class="modal-actions">
+        <button class="btn-secondary" id="m-cancel">Cancelar</button>
+        <button class="btn-primary" id="m-save" style="padding:10px 16px;border-radius:6px;">Salvar</button>
+      </div>`;
+    const preview = modal.querySelector('#m-av-preview');
+    preview.style.background = state.me.color;
+    if (state.me.avatarUrl) {
+      const img = document.createElement('img');
+      img.src = state.me.avatarUrl + (state.me.avatarUrl.includes('?') ? '&' : '?') + 't=' + Date.now();
+      preview.appendChild(img);
+    } else {
+      preview.textContent = initials(state.me.username);
+    }
+    let chosenStatus = state.me.status || 'online';
+    let avatarFile = null;
+    const opts = modal.querySelector('#m-status-options');
+    for (const key of ['online', 'idle', 'dnd', 'invisible']) {
+      const b = document.createElement('button');
+      b.className = 'status-option' + (key === chosenStatus ? ' selected' : '');
+      b.innerHTML = `<span class="presence-dot" style="background:${STATUS_META[key].color}"></span> ${STATUS_META[key].label}`;
+      b.addEventListener('click', () => {
+        chosenStatus = key;
+        opts.querySelectorAll('.status-option').forEach(x => x.classList.remove('selected'));
+        b.classList.add('selected');
+      });
+      opts.appendChild(b);
+    }
+    modal.querySelector('#m-av-change').addEventListener('click', () => modal.querySelector('#m-av-file').click());
+    modal.querySelector('#m-av-file').addEventListener('change', async e => {
+      const f = e.target.files[0];
+      if (!f) return;
+      try {
+        avatarFile = await fileToAvatarBlob(f);
+        preview.innerHTML = '';
+        const img = document.createElement('img');
+        img.src = URL.createObjectURL(avatarFile);
+        preview.appendChild(img);
+      } catch (err) {
+        const eb = modal.querySelector('#m-profile-error');
+        eb.textContent = err.message;
+        eb.classList.remove('hidden');
+      }
+    });
+    modal.querySelector('#m-cancel').addEventListener('click', closeModal);
+    modal.querySelector('#m-save').addEventListener('click', async () => {
+      const eb = modal.querySelector('#m-profile-error');
+      try {
+        if (avatarFile) await API.post('/api/me/avatar', avatarFile);
+        const st = await API.patch('/api/me/status', { status: chosenStatus, statusText: modal.querySelector('#m-statustext').value });
+        await API.patch('/api/me/profile', { bio: modal.querySelector('#m-bio').value });
+        Object.assign(state.me, st.user);
+        closeModal();
+        renderUserPanel();
+      } catch (err) {
+        eb.textContent = err.message;
+        eb.classList.remove('hidden');
+      }
+    });
+  });
+}
+
+function pinsModal() {
+  let qs = '';
+  if (state.homeMode) {
+    if (!state.activeDmPeerId) return alert('Abra uma conversa primeiro.');
+    qs = `?peerId=${state.activeDmPeerId}`;
+  } else {
+    if (!state.currentChannelId) return alert('Selecione um canal.');
+    qs = `?channelId=${state.currentChannelId}`;
+  }
+  API.get(`/api/pins${qs}`).then(({ pins }) => {
+    showModal(modal => {
+      modal.innerHTML = `<h2>&#128204; Mensagens fixadas</h2><div class="pins-list" id="pins-list"></div>
+        <div class="modal-actions"><button class="btn-secondary" id="m-close">Fechar</button></div>`;
+      const list = modal.querySelector('#pins-list');
+      if (!pins.length) list.innerHTML = '<p class="desc">Nenhuma mensagem fixada ainda. Passe o mouse sobre uma mensagem e clique no alfinete.</p>';
+      for (const p of [...pins].reverse()) {
+        const row = document.createElement('div');
+        row.className = 'pin-row';
+        row.appendChild(avatarEl({ color: p.color, username: p.username }, 'avatar-sm'));
+        const info = document.createElement('div');
+        info.className = 'pin-info';
+        const meta = document.createElement('div');
+        meta.className = 'pin-meta';
+        meta.textContent = `${p.username} - ${new Date(p.createdAt).toLocaleString('pt-BR')}`;
+        const content = document.createElement('div');
+        content.className = 'pin-content';
+        content.textContent = p.content || '(anexo)';
+        info.appendChild(meta);
+        info.appendChild(content);
+        row.appendChild(info);
+        const actionsBox = document.createElement('div');
+        actionsBox.className = 'pin-actions';
+        const canUnpin = p.userId === state.me.id || (!state.homeMode && canModerateClient(p.serverId));
+        if (canUnpin) {
+          const unpin = document.createElement('button');
+          unpin.className = 'req-btn deny';
+          unpin.innerHTML = '&#128204;';
+          unpin.title = 'Desafixar';
+          unpin.addEventListener('click', async () => {
+            try {
+              await API.post(`/api/messages/${p.id}/pin`);
+              row.remove();
+            } catch (err) { alert(err.message); }
+          });
+          actionsBox.appendChild(unpin);
+        }
+        const jump = document.createElement('button');
+        jump.className = 'req-btn';
+        jump.title = 'Ir para a mensagem';
+        jump.innerHTML = '&#8599;';
+        jump.addEventListener('click', () => {
+          closeModal();
+          const target = document.querySelector(`.message[data-id="${p.id}"]`);
+          if (target) {
+            target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            target.classList.add('flash');
+            setTimeout(() => target.classList.remove('flash'), 1600);
+          }
+        });
+        actionsBox.appendChild(jump);
+        row.appendChild(actionsBox);
+        list.appendChild(row);
+      }
+      modal.querySelector('#m-close').addEventListener('click', closeModal);
+    });
+  }).catch(err => alert(err.message));
+}
+
+function searchModal() {
+  if (state.homeMode || !state.currentServerId) return;
+  showModal(modal => {
+    modal.innerHTML = `
+      <h2>Buscar no servidor</h2>
+      <div class="search-box">
+        <input type="text" id="m-search-q" maxlength="100" placeholder="Digite para buscar nas mensagens..." autofocus>
+        <button class="btn-primary btn-sm" id="m-search-go">Buscar</button>
+      </div>
+      <div class="search-results" id="m-search-results"><p class="desc">Os resultados aparecem aqui.</p></div>
+      <div class="modal-actions"><button class="btn-secondary" id="m-close">Fechar</button></div>`;
+    const input = modal.querySelector('#m-search-q');
+    const resultsBox = modal.querySelector('#m-search-results');
+    input.focus();
+    const runSearch = async () => {
+      const q = input.value.trim();
+      if (q.length < 2) return;
+      resultsBox.innerHTML = '<p class="desc">Buscando...</p>';
+      try {
+        const { results } = await API.get(`/api/servers/${state.currentServerId}/search?q=${encodeURIComponent(q)}`);
+        resultsBox.innerHTML = '';
+        if (!results.length) {
+          resultsBox.innerHTML = '<p class="desc">Nenhum resultado.</p>';
+          return;
+        }
+        for (const r of results) {
+          const row = document.createElement('button');
+          row.className = 'search-row';
+          const head = document.createElement('div');
+          head.className = 'pin-meta';
+          head.innerHTML = `<strong style="color:#5865f2;">#${escapeHtml(r.channelName)}</strong> - ${escapeHtml(r.username)} - ${new Date(r.createdAt).toLocaleString('pt-BR')}`;
+          const content = document.createElement('div');
+          content.className = 'pin-content';
+          content.textContent = r.content;
+          row.appendChild(head);
+          row.appendChild(content);
+          row.addEventListener('click', () => {
+            closeModal();
+            if (r.channelId !== state.currentChannelId) {
+              selectChannel(r.channelId).then(() => jumpToMessage(r.id));
+            } else {
+              jumpToMessage(r.id);
+            }
+          });
+          resultsBox.appendChild(row);
+        }
+      } catch (err) {
+        resultsBox.innerHTML = `<p class="desc">${escapeHtml(err.message)}</p>`;
+      }
+    };
+    modal.querySelector('#m-search-go').addEventListener('click', runSearch);
+    input.addEventListener('keydown', e => { if (e.key === 'Enter') runSearch(); });
+    modal.querySelector('#m-close').addEventListener('click', closeModal);
+  });
+}
+
+function jumpToMessage(messageId) {
+  setTimeout(() => {
+    const target = document.querySelector(`.message[data-id="${messageId}"]`);
+    if (target) {
+      target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      target.classList.add('flash');
+      setTimeout(() => target.classList.remove('flash'), 1600);
+    }
+  }, 250);
+}
+
+function channelManageModal(ch) {
+  if (state.homeMode || !canModerateClient(state.currentServerId)) return;
+  showModal(modal => {
+    modal.innerHTML = `
+      <h2>#${escapeHtml(ch.name)}</h2>
+      <label>Novo nome
+        <input type="text" id="m-ch-name" maxlength="32" value="${escapeHtml(ch.name)}">
+      </label>
+      <div class="auth-error hidden" id="m-ch-error"></div>
+      <div class="modal-actions">
+        <button class="btn-secondary" id="m-cancel">Cancelar</button>
+        ${ch.type !== 'voice' ? '<button class="btn-primary" id="m-save" style="padding:10px 16px;border-radius:6px;">Salvar</button>' : ''}
+        <button class="btn-secondary btn-danger-text" id="m-delete">&#128465; Excluir canal</button>
+      </div>`;
+    modal.querySelector('#m-cancel').addEventListener('click', closeModal);
+    const saveBtn = modal.querySelector('#m-save');
+    if (saveBtn) saveBtn.addEventListener('click', async () => {
+      try {
+        await API.patch(`/api/channels/${ch.id}`, { name: modal.querySelector('#m-ch-name').value });
+        closeModal();
+      } catch (err) {
+        const eb = modal.querySelector('#m-ch-error');
+        eb.textContent = err.message;
+        eb.classList.remove('hidden');
+      }
+    });
+    modal.querySelector('#m-delete').addEventListener('click', async () => {
+      if (!confirm(`Excluir o canal #${ch.name}? As mensagens serao perdidas.`)) return;
+      try {
+        await API.del(`/api/channels/${ch.id}`);
+        closeModal();
+      } catch (err) { alert(err.message); }
+    });
+  });
+}
+
+function bansModal() {
+  const sid = state.currentServerId;
+  if (!sid || !canModerateClient(sid)) return;
+  API.get(`/api/servers/${sid}/bans`).then(({ bans }) => {
+    showModal(modal => {
+      modal.innerHTML = `<h2>&#9940; Banimentos</h2><div class="pins-list" id="bans-list"></div>
+        <div class="modal-actions"><button class="btn-secondary" id="m-close">Fechar</button></div>`;
+      const list = modal.querySelector('#bans-list');
+      if (!bans.length) list.innerHTML = '<p class="desc">Ninguem banido neste servidor.</p>';
+      for (const b of bans) {
+        const row = document.createElement('div');
+        row.className = 'pin-row';
+        const info = document.createElement('div');
+        info.className = 'pin-info';
+        info.innerHTML = `<strong>${escapeHtml(b.username)}</strong>${b.reason ? ` - <span class="desc">${escapeHtml(b.reason)}</span>` : ''}`;
+        row.appendChild(info);
+        const unban = document.createElement('button');
+        unban.className = 'req-btn';
+        unban.textContent = 'Desbanir';
+        unban.addEventListener('click', async () => {
+          try {
+            await API.del(`/api/servers/${sid}/bans/${b.userId}`);
+            row.remove();
+          } catch (err) { alert(err.message); }
+        });
+        row.appendChild(unban);
+        list.appendChild(row);
+      }
+      modal.querySelector('#m-close').addEventListener('click', closeModal);
+    });
+  }).catch(err => alert(err.message));
+}
+
+el('me-avatar').parentElement.addEventListener('click', e => {
+  if (e.target.closest('#btn-logout') || e.target.closest('#me-handle')) return;
+  myProfileModal();
+});
+
 el('btn-server-menu').addEventListener('click', () => {
   const server = currentServer();
   if (!server) return;
   const isOwner = server.ownerId === state.me.id;
+  const isMod = canModerateClient(server.id);
   showModal(modal => {
     modal.innerHTML = `
       <h2>${escapeHtml(server.name)}</h2>
-      <p class="desc">Codigo de convite: <strong style="letter-spacing:2px;">${server.inviteCode}</strong> | O NexoBot responde a /ajuda no chat.</p>
+      <p class="desc">Codigo de convite: <strong style="letter-spacing:2px;" id="m-invite-code">${server.inviteCode}</strong> | O NexoBot responde a /ajuda no chat.</p>
       <div class="modal-actions" style="flex-direction:column;align-items:stretch;">
         <button class="btn-secondary" id="m-add-channel">+ Criar canal</button>
+        ${isMod ? '<button class="btn-secondary" id="m-regen-invite">&#128257; Gerar novo codigo de convite</button>' : ''}
         <button class="btn-secondary" id="m-manage-roles">Gerenciar cargos</button>
+        ${isMod ? '<button class="btn-secondary" id="m-bans">&#9940; Banimentos</button>' : ''}
         ${isOwner ? '<button class="btn-secondary" id="m-add-bot">Criar bot personalizado</button>' : ''}
+        ${isOwner
+          ? '<button class="btn-secondary btn-danger-text" id="m-delete-server">&#128465; Excluir servidor</button>'
+          : '<button class="btn-secondary btn-danger-text" id="m-leave-server">&#128682; Sair do servidor</button>'}
         <button class="btn-secondary" id="m-close">Fechar</button>
       </div>`;
     modal.querySelector('#m-add-channel').addEventListener('click', () => el('btn-new-channel').click());
     modal.querySelector('#m-manage-roles').addEventListener('click', rolesManagerModal);
+    const regenBtn = modal.querySelector('#m-regen-invite');
+    if (regenBtn) regenBtn.addEventListener('click', async () => {
+      try {
+        const data = await API.post(`/api/servers/${server.id}/invite/regenerate`);
+        server.inviteCode = data.inviteCode;
+        modal.querySelector('#m-invite-code').textContent = data.inviteCode;
+      } catch (err) { alert(err.message); }
+    });
+    const bansBtn = modal.querySelector('#m-bans');
+    if (bansBtn) bansBtn.addEventListener('click', bansModal);
     const botBtn = modal.querySelector('#m-add-bot');
     if (botBtn) botBtn.addEventListener('click', () => createBotModal(server));
+    const leaveBtn = modal.querySelector('#m-leave-server');
+    if (leaveBtn) leaveBtn.addEventListener('click', async () => {
+      if (!confirm(`Sair do servidor "${server.name}"?`)) return;
+      try {
+        await API.post(`/api/servers/${server.id}/leave`);
+        closeModal();
+        state.servers = state.servers.filter(s => s.id !== server.id);
+        renderRail();
+        selectHome();
+      } catch (err) { alert(err.message); }
+    });
+    const deleteBtn = modal.querySelector('#m-delete-server');
+    if (deleteBtn) deleteBtn.addEventListener('click', async () => {
+      if (!confirm(`EXCLUIR o servidor "${server.name}" para sempre? Canais e mensagens serao apagados.`)) return;
+      try {
+        await API.del(`/api/servers/${server.id}`);
+        closeModal();
+        state.servers = state.servers.filter(s => s.id !== server.id);
+        renderRail();
+        selectHome();
+      } catch (err) { alert(err.message); }
+    });
     modal.querySelector('#m-close').addEventListener('click', closeModal);
   });
 });
@@ -2075,5 +2653,8 @@ function createBotModal(server) {
 el('btn-members-toggle').addEventListener('click', () => {
   appView.classList.toggle('members-hidden');
 });
+
+el('btn-pins').addEventListener('click', pinsModal);
+el('btn-search').addEventListener('click', searchModal);
 
 boot();

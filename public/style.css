@@ -1,4 +1,4 @@
-:root {
+﻿:root {
   --bg-rail: #1e1f22;
   --bg-sidebar: #2b2d31;
   --bg-chat: #313338;
@@ -1228,3 +1228,134 @@ input {
 }
 
 .member-modal-handle:hover { text-decoration: underline; }
+
+/* ===== presenca e status ===== */
+.avatar img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: inherit;
+}
+.avatar { position: relative; }
+.me-status-dot {
+  position: absolute;
+  right: -2px;
+  bottom: -2px;
+  border: 2px solid #1e1f22;
+  border-radius: 50%;
+}
+.user-panel { position: relative; }
+.presence-dot.status-online { background: #3ba55d; }
+.presence-dot.status-idle { background: #faa61a; }
+.presence-dot.status-dnd { background: #ed4245; }
+.presence-dot.status-offline,
+.presence-dot.status-invisible { background: #747f8d; }
+
+/* ===== nao lidas por canal ===== */
+.channel-item.has-unread .hash + span { color: #fff; font-weight: 600; }
+.channel-item .unread-badge {
+  margin-left: auto;
+  background: #f23f43;
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 9px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* ===== canal: engrenagem ===== */
+.channel-gear {
+  margin-left: auto;
+  opacity: 0;
+  font-size: 13px;
+  color: var(--text-muted);
+  padding: 0 4px;
+}
+.channel-item:hover .channel-gear { opacity: 1; }
+.channel-gear:hover { color: #fff; }
+
+/* ===== mensagens fixadas ===== */
+.message.pinned-msg { box-shadow: inset 2px 0 0 #faa61a; }
+.pin-flag {
+  position: absolute;
+  right: 8px;
+  top: 6px;
+  font-size: 12px;
+  opacity: .7;
+}
+.flash { animation: msg-flash 1.6s ease; }
+@keyframes msg-flash {
+  0% { background: rgba(250,166,26,.28); }
+  100% { background: transparent; }
+}
+
+/* ===== modais: perfil / pins / busca / bans ===== */
+.profile-head { display: flex; gap: 14px; align-items: center; margin-bottom: 14px; }
+.profile-head .avatar { width: 64px; height: 64px; font-size: 26px; }
+.profile-head-info { display: flex; flex-direction: column; gap: 6px; align-items: flex-start; }
+.btn-sm { padding: 6px 10px !important; font-size: 12px; }
+.status-options { display: flex; gap: 8px; flex-wrap: wrap; margin: 6px 0 12px; }
+.status-option {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  background: #2b2d31;
+  border: 1.5px solid transparent;
+  color: var(--text-normal);
+  padding: 7px 12px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+}
+.status-option.selected { border-color: #5865f2; background: #393c43; }
+.member-modal-bio {
+  margin-top: 8px;
+  font-size: 13px;
+  color: var(--text-normal);
+  background: #2b2d31;
+  border-radius: 6px;
+  padding: 8px 10px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.btn-danger-text { color: #f26d6d !important; }
+.btn-danger-text:hover { background: rgba(240,71,71,.12) !important; }
+
+.pins-list, .search-results {
+  max-height: 320px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 10px 0 14px;
+}
+.pin-row {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  background: #2b2d31;
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+.pin-info { flex: 1; min-width: 0; }
+.pin-meta { font-size: 12px; color: var(--text-muted); }
+.pin-content { font-size: 14px; word-break: break-word; white-space: pre-wrap; }
+.pin-actions { display: flex; gap: 6px; }
+
+.search-box { display: flex; gap: 8px; margin-bottom: 6px; }
+.search-box input { flex: 1; }
+.search-row {
+  text-align: left;
+  background: #2b2d31;
+  border-radius: 8px;
+  padding: 10px 12px;
+  cursor: pointer;
+  color: var(--text-normal);
+  border: none;
+}
+.search-row:hover { background: #393c43; }

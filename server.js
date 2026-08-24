@@ -49,7 +49,25 @@ function hashPassword(password, salt) {
 }
 
 function publicUser(user) {
-  return { id: user.id, username: user.username, tag: user.tag || null, color: user.color, createdAt: user.createdAt, isBot: !!user.isBot };
+  return {
+    id: user.id, username: user.username, tag: user.tag || null, color: user.color,
+    createdAt: user.createdAt, isBot: !!user.isBot,
+    avatarUrl: user.avatarFile ? `/api/avatars/${user.id}?v=${user.avatarV || 0}` : null,
+    status: user.isBot ? 'online' : (user.status || 'online'),
+    statusText: user.statusText || '',
+    bio: user.bio || ''
+  };
+}
+
+function isConnected(userId) {
+  return sseClients.has(userId) && [...sseClients.get(userId)].some(c => c.readyState === 1);
+}
+
+function effectivelyOnline(userId) {
+  const u = store.db.users.find(x => x.id === userId);
+  if (!u) return false;
+  if (u.status === 'invisible') return false;
+  return isConnected(userId);
 }
 
 function genTag() {
@@ -227,12 +245,35 @@ function broadcastServer(serverId, event, exceptUserId) {
 function broadcastPresence(userId, online) {
   const user = store.db.users.find(u => u.id === userId);
   if (!user) return;
-  const event = { type: 'presence', userId, username: user.username, color: user.color, online };
+  const event = {
+    type: 'presence', userId, username: user.username, color: user.color,
+    online: online && user.status !== 'invisible',
+    status: online ? (user.status || 'online') : null,
+    statusText: online ? (user.statusText || '') : ''
+  };
   for (const s of serversOf(userId)) broadcastServer(s.id, event);
   for (const partner of dmPartners(userId)) sendToUser(partner, event);
   for (const f of store.db.friends) {
     if (f.a === userId) sendToUser(f.b, event);
     else if (f.b === userId) sendToUser(f.a, event);
+  }
+}
+
+function broadcastStatusUpdate(user) {
+  const visible = isConnected(user.id) && user.status !== 'invisible';
+  const event = {
+    type: 'presence_status',
+    userId: user.id,
+    status: user.status || 'online',
+    statusText: user.statusText || '',
+    online: visible
+  };
+  const presence = { type: 'presence', userId: user.id, username: user.username, color: user.color, online: visible, status: visible ? (user.status || 'online') : null, statusText: visible ? (user.statusText || '') : '' };
+  for (const s of serversOf(user.id)) broadcastServer(s.id, event);
+  for (const partner of dmPartners(user.id)) { sendToUser(partner, event); sendToUser(partner, presence); }
+  for (const f of store.db.friends) {
+    if (f.a === user.id) { sendToUser(f.b, event); sendToUser(f.b, presence); }
+    else if (f.b === user.id) { sendToUser(f.a, event); sendToUser(f.a, presence); }
   }
 }
 
@@ -306,6 +347,24 @@ function postMessageInternal(user, channelId, content, attachmentIds) {
     .map(id => store.db.attachments.find(a => a.id === id))
     .filter(Boolean)
     .slice(0, 5);
+  const names = new Set();
+  const mentionRe = /@([A-Za-z0-9_]{3,24})/g;
+  let mm;
+  while ((mm = mentionRe.exec(content)) !== null) names.add(mm[1].toLowerCase());
+  let mentionIds = [];
+  if (names.size) {
+    let pool = [];
+    if (isDm) {
+      const partsDm = channelId.split('_');
+      pool = store.db.users.filter(u => u.id === partsDm[1] || u.id === partsDm[2]);
+    } else {
+      pool = store.db.members
+        .filter(m => m.serverId === channel.serverId)
+        .map(m => store.db.users.find(u => u.id === m.userId))
+        .filter(Boolean);
+    }
+    mentionIds = pool.filter(u => !u.isBot && names.has(u.username.toLowerCase()) && u.id !== user.id).map(u => u.id);
+  }
   const message = {
     id: genId(),
     channelId,
@@ -318,6 +377,8 @@ function postMessageInternal(user, channelId, content, attachmentIds) {
     attachments,
     reactions: {},
     editedAt: null,
+    pinned: false,
+    mentionIds,
     createdAt: now
   };
   if (channel) {
@@ -416,9 +477,10 @@ async function handleUpload(req, res, url, me) {
 
 async function handleApi(req, res, url) {
   const route = `${req.method} ${url.pathname}`;
-  const isUpload = route === 'POST /api/upload';
+  const isUpload = route === 'POST /api/upload' || route === 'POST /api/me/avatar';
   const body = !isUpload && ['POST', 'PUT', 'PATCH'].includes(req.method) ? await readBody(req) : {};
   const me = getAuthUser(req);
+  let match = null;
 
   if (route === 'POST /api/register') {
     const username = String(body.username || '').trim();
@@ -487,10 +549,65 @@ async function handleApi(req, res, url) {
     return json(res, 201, { message });
   }
 
+  match = url.pathname.match(/^\/api\/avatars\/([a-z0-9]+)$/);
+  if (match && req.method === 'GET') {
+    const u = store.db.users.find(x => x.id === match[1]);
+    if (!u || !u.avatarFile) return json(res, 404, { error: 'Sem avatar' });
+    const filePath = path.join(UPLOAD_DIR, u.avatarFile);
+    if (!fs.existsSync(filePath)) return json(res, 404, { error: 'Sem avatar' });
+    const ctype = u.avatarFile.endsWith('.png') ? 'image/png' : u.avatarFile.endsWith('.gif') ? 'image/gif' : u.avatarFile.endsWith('.webp') ? 'image/webp' : 'image/jpeg';
+    res.writeHead(200, { 'Content-Type': ctype, 'Cache-Control': 'no-cache' });
+    return res.end(fs.readFileSync(filePath));
+  }
+
   if (!me) return json(res, 401, { error: 'Nao autenticado' });
 
   if (route === 'GET /api/me') {
     return json(res, 200, { user: publicUser(me), servers: serversOf(me.id) });
+  }
+
+  if (route === 'PATCH /api/me/status') {
+    const allowed = ['online', 'idle', 'dnd', 'invisible'];
+    const status = allowed.includes(body.status) ? body.status : null;
+    if (!status) return json(res, 400, { error: 'Status invalido' });
+    const statusText = String(body.statusText || '').trim().slice(0, 128);
+    me.status = status;
+    me.statusText = statusText;
+    store.save();
+    broadcastStatusUpdate(me);
+    return json(res, 200, { user: publicUser(me) });
+  }
+
+  if (route === 'PATCH /api/me/profile') {
+    if (body.bio !== undefined) {
+      me.bio = String(body.bio || '').trim().slice(0, 200);
+    }
+    store.save();
+    return json(res, 200, { user: publicUser(me) });
+  }
+
+  if (route === 'POST /api/me/avatar') {
+    const ctype = String(req.headers['content-type'] || '');
+    const exts = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/gif': 'gif', 'image/webp': 'webp' };
+    const ext = exts[ctype.split(';')[0].trim()];
+    if (!ext) return json(res, 400, { error: 'Envie uma imagem PNG, JPG, GIF ou WEBP' });
+    let raw;
+    try {
+      raw = await readRaw(req, 512 * 1024);
+    } catch {
+      return json(res, 413, { error: 'Imagem grande demais (max 512 KB)' });
+    }
+    fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+    const name = `av_${me.id}_${Date.now()}.${ext}`;
+    fs.writeFileSync(path.join(UPLOAD_DIR, name), raw);
+    if (me.avatarFile && me.avatarFile !== name) {
+      try { fs.unlinkSync(path.join(UPLOAD_DIR, me.avatarFile)); } catch {}
+    }
+    me.avatarFile = name;
+    me.avatarV = Date.now();
+    store.save();
+    broadcastStatusUpdate(me);
+    return json(res, 200, { user: publicUser(me) });
   }
 
   if (route === 'POST /api/logout') {
@@ -521,6 +638,9 @@ async function handleApi(req, res, url) {
     const code = String(body.inviteCode || '').trim().toUpperCase();
     const server = store.db.servers.find(s => s.inviteCode === code);
     if (!server) return json(res, 404, { error: 'Codigo de convite invalido' });
+    if ((server.bans || []).some(b => b.userId === me.id)) {
+      return json(res, 403, { error: 'Voce esta banido deste servidor' });
+    }
     if (!isMember(server.id, me.id)) {
       store.db.members.push({ serverId: server.id, userId: me.id, joinedAt: Date.now() });
       addBotMembership(server.id, ensureNexoBot().id);
@@ -535,7 +655,7 @@ async function handleApi(req, res, url) {
     return json(res, 200, { server, channels });
   }
 
-  let match = url.pathname.match(/^\/api\/servers\/([a-z0-9]+)\/channels$/);
+  match = url.pathname.match(/^\/api\/servers\/([a-z0-9]+)\/channels$/);
   if (match && req.method === 'GET') {
     const serverId = match[1];
     if (!isMember(serverId, me.id)) return json(res, 403, { error: 'Sem acesso' });
@@ -570,9 +690,101 @@ async function handleApi(req, res, url) {
         return u ? { ...publicUser(u), roleIds: m.roleIds || [] } : null;
       })
       .filter(Boolean);
-    const online = members.filter(u => sseClients.has(u.id)).map(u => u.id);
+    const online = members.filter(u => effectivelyOnline(u.id)).map(u => u.id);
     const server = store.db.servers.find(s => s.id === serverId);
     return json(res, 200, { members, online, roles: server.roles || [] });
+  }
+
+  match = url.pathname.match(/^\/api\/servers\/([a-z0-9]+)\/members\/([a-z0-9]+)\/(kick|ban)$/);
+  if (match && req.method === 'POST') {
+    const [, serverId, targetId, action] = match;
+    if (!canModerate(serverId, me.id)) return json(res, 403, { error: 'Sem permissao de moderacao' });
+    if (targetId === me.id) return json(res, 400, { error: 'Voce nao pode fazer isso a si mesmo' });
+    const server = store.db.servers.find(s => s.id === serverId);
+    if (!server || server.ownerId === targetId) return json(res, 400, { error: 'Nao e possivel moderar o dono' });
+    const member = store.db.members.find(m => m.serverId === serverId && m.userId === targetId);
+    if (!member) return json(res, 404, { error: 'Membro nao encontrado' });
+    store.db.members = store.db.members.filter(m => m !== member);
+    leaveVoiceAll(targetId);
+    let ban = null;
+    if (action === 'ban') {
+      ban = { userId: targetId, reason: String(body.reason || '').slice(0, 200), at: Date.now(), by: me.id };
+      server.bans = server.bans || [];
+      server.bans.push(ban);
+    }
+    store.save();
+    broadcastServer(serverId, { type: 'member_leave', serverId, userId: targetId, [action === 'ban' ? 'banned' : 'kicked']: true });
+    sendToUser(targetId, { type: action === 'ban' ? 'you_were_banned' : 'you_were_kicked', serverId, serverName: server.name });
+    return json(res, 200, { ok: true, ban });
+  }
+
+  match = url.pathname.match(/^\/api\/servers\/([a-z0-9]+)\/bans$/);
+  if (match && req.method === 'GET') {
+    const serverId = match[1];
+    if (!canModerate(serverId, me.id)) return json(res, 403, { error: 'Sem permissao' });
+    const server = store.db.servers.find(s => s.id === serverId);
+    const bans = (server.bans || []).map(b => {
+      const u = store.db.users.find(x => x.id === b.userId);
+      return { ...b, username: u ? u.username : '(conta apagada)' };
+    }).reverse();
+    return json(res, 200, { bans });
+  }
+
+  match = url.pathname.match(/^\/api\/servers\/([a-z0-9]+)\/bans\/([a-z0-9]+)$/);
+  if (match && req.method === 'DELETE') {
+    const [, serverId, banUserId] = match;
+    if (!canModerate(serverId, me.id)) return json(res, 403, { error: 'Sem permissao' });
+    const server = store.db.servers.find(s => s.id === serverId);
+    const before = (server.bans || []).length;
+    server.bans = (server.bans || []).filter(b => b.userId !== banUserId);
+    if (server.bans.length === before) return json(res, 404, { error: 'Banimento nao encontrado' });
+    store.save();
+    return json(res, 200, { ok: true });
+  }
+
+  match = url.pathname.match(/^\/api\/servers\/([a-z0-9]+)\/leave$/);
+  if (match && req.method === 'POST') {
+    const serverId = match[1];
+    const server = store.db.servers.find(s => s.id === serverId);
+    if (!server) return json(res, 404, { error: 'Servidor nao encontrado' });
+    if (server.ownerId === me.id) return json(res, 400, { error: 'O dono nao pode sair. Exclua o servidor em vez disso.' });
+    const member = store.db.members.find(m => m.serverId === serverId && m.userId === me.id);
+    if (!member) return json(res, 400, { error: 'Voce nao e membro' });
+    store.db.members = store.db.members.filter(m => m !== member);
+    leaveVoiceAll(me.id);
+    store.save();
+    broadcastServer(serverId, { type: 'member_leave', serverId, userId: me.id });
+    return json(res, 200, { ok: true });
+  }
+
+  match = url.pathname.match(/^\/api\/servers\/([a-z0-9]+)\/invite\/regenerate$/);
+  if (match && req.method === 'POST') {
+    const serverId = match[1];
+    const server = store.db.servers.find(s => s.id === serverId);
+    if (!server || !canModerate(serverId, me.id)) return json(res, 403, { error: 'Sem permissao' });
+    server.inviteCode = genInviteCode();
+    store.save();
+    broadcastServer(serverId, { type: 'invite_regenerated', serverId, inviteCode: server.inviteCode });
+    return json(res, 200, { inviteCode: server.inviteCode });
+  }
+
+  match = url.pathname.match(/^\/api\/servers\/([a-z0-9]+)$/);
+  if (match && req.method === 'DELETE') {
+    const serverId = match[1];
+    const server = store.db.servers.find(s => s.id === serverId);
+    if (!server) return json(res, 404, { error: 'Servidor nao encontrado' });
+    if (server.ownerId !== me.id) return json(res, 403, { error: 'Apenas o dono pode excluir o servidor' });
+    for (const m of [...store.db.members].filter(x => x.serverId === serverId)) {
+      sendToUser(m.userId, { type: 'server_deleted', serverId, serverName: server.name });
+    }
+    const channelIds = new Set(store.db.channels.filter(c => c.serverId === serverId).map(c => c.id));
+    for (const cid of channelIds) voiceRooms.delete(cid);
+    store.db.channels = store.db.channels.filter(c => c.serverId !== serverId);
+    store.db.messages = store.db.messages.filter(msg => !channelIds.has(msg.channelId));
+    store.db.members = store.db.members.filter(m => m.serverId !== serverId);
+    store.db.servers = store.db.servers.filter(s => s.id !== serverId);
+    store.save();
+    return json(res, 200, { ok: true });
   }
 
   match = url.pathname.match(/^\/api\/servers\/([a-z0-9]+)\/bots$/);
@@ -594,6 +806,35 @@ async function handleApi(req, res, url) {
     store.save();
     broadcastServer(serverId, { type: 'member_join', serverId, user: publicUser(bot) });
     return json(res, 201, { bot: publicUser(bot), token });
+  }
+
+  match = url.pathname.match(/^\/api\/channels\/([a-z0-9]+)$/);
+  if (match && req.method === 'PATCH') {
+    const channelId = match[1];
+    const channel = store.db.channels.find(c => c.id === channelId);
+    if (!channel || !canModerate(channel.serverId, me.id)) return json(res, 403, { error: 'Sem permissao' });
+    const name = String(body.name || '').trim().toLowerCase().replace(/\s+/g, '-').slice(0, 32);
+    if (!/^[a-z0-9_-]{2,32}$/.test(name)) return json(res, 400, { error: 'Nome de canal invalido' });
+    channel.name = name;
+    store.save();
+    broadcastServer(channel.serverId, { type: 'channel_update', channel });
+    return json(res, 200, { channel });
+  }
+
+  if (match && req.method === 'DELETE') {
+    const channelId = match[1];
+    const channel = store.db.channels.find(c => c.id === channelId);
+    if (!channel || !canModerate(channel.serverId, me.id)) return json(res, 403, { error: 'Sem permissao' });
+    const siblings = store.db.channels.filter(c => c.serverId === channel.serverId && c.type === channel.type);
+    if (channel.type !== 'voice' && siblings.length <= 1) {
+      return json(res, 400, { error: 'Nao e possivel excluir o ultimo canal de texto' });
+    }
+    store.db.channels = store.db.channels.filter(c => c.id !== channelId);
+    store.db.messages = store.db.messages.filter(m => m.channelId !== channelId);
+    voiceRooms.delete(channelId);
+    store.save();
+    broadcastServer(channel.serverId, { type: 'channel_delete', serverId: channel.serverId, channelId });
+    return json(res, 200, { ok: true });
   }
 
   match = url.pathname.match(/^\/api\/channels\/([a-z0-9]+)\/messages$/);
@@ -681,7 +922,7 @@ async function handleApi(req, res, url) {
       .map(f => (f.a === me.id ? f.b : f.a))
       .map(uid => {
         const u = store.db.users.find(x => x.id === uid);
-        return u ? { ...publicUser(u), online: sseClients.has(u.id) } : null;
+    return u ? { ...publicUser(u), online: effectivelyOnline(u.id) } : null;
       })
       .filter(Boolean);
     const incoming = store.db.friendRequests
@@ -775,7 +1016,7 @@ async function handleApi(req, res, url) {
       if (!partner) continue;
       conversations.push({
         partner: publicUser(partner),
-        online: sseClients.has(partnerId),
+        online: effectivelyOnline(partnerId),
         lastMessage: { content: msg.content, createdAt: msg.createdAt, fromMe: msg.userId === me.id }
       });
       if (conversations.length >= 50) break;
@@ -865,6 +1106,58 @@ async function handleApi(req, res, url) {
     store.save();
     broadcastServer(serverId, { type: 'member_update', serverId, userId: targetUserId, roleIds: member.roleIds });
     return json(res, 200, { roleIds: member.roleIds });
+  }
+
+  match = url.pathname.match(/^\/api\/messages\/([a-z0-9]+)\/pin$/);
+  if (match && req.method === 'POST') {
+    const found = findMessageForUser(match[1], me);
+    if (!found.message) return json(res, 404, { error: 'Mensagem nao encontrada' });
+    const msg = found.message;
+    const canPin = msg.userId === me.id || (!found.isDm && canModerate(found.serverId, me.id));
+    if (!canPin) return json(res, 403, { error: 'Sem permissao para fixar' });
+    msg.pinned = !msg.pinned;
+    store.save();
+    broadcastMessageEvent(msg, { type: 'pins_update', channelId: msg.channelId, messageId: msg.id, pinned: msg.pinned });
+    return json(res, 200, { pinned: msg.pinned });
+  }
+
+  match = url.pathname.match(/^\/api\/pins$/);
+  if (match && req.method === 'GET') {
+    let ids = [];
+    if (url.searchParams.get('channelId')) {
+      const channel = store.db.channels.find(c => c.id === url.searchParams.get('channelId'));
+      if (!channel || !isMember(channel.serverId, me.id)) return json(res, 403, { error: 'Sem acesso' });
+      ids.push(channel.id);
+    } else if (url.searchParams.get('peerId')) {
+      ids.push(dmKey(me.id, String(url.searchParams.get('peerId'))));
+    } else {
+      return json(res, 400, { error: 'Informe channelId ou peerId' });
+    }
+    const pins = store.db.messages.filter(m => m.pinned && ids.includes(m.channelId)).slice(-50);
+    return json(res, 200, { pins });
+  }
+
+  match = url.pathname.match(/^\/api\/servers\/([a-z0-9]+)\/search$/);
+  if (match && req.method === 'GET') {
+    const serverId = match[1];
+    if (!isMember(serverId, me.id)) return json(res, 403, { error: 'Sem acesso' });
+    const q = String(url.searchParams.get('q') || '').trim().toLowerCase();
+    if (q.length < 2) return json(res, 400, { error: 'Termo muito curto' });
+    const channelsById = new Map(store.db.channels.filter(c => c.serverId === serverId).map(c => [c.id, c]));
+    const results = [];
+    for (let i = store.db.messages.length - 1; i >= 0 && results.length < 50; i--) {
+      const m = store.db.messages[i];
+      if (!m.serverId || m.serverId !== serverId) continue;
+      if (!channelsById.has(m.channelId)) continue;
+      if (m.content.toLowerCase().includes(q)) {
+        results.push({
+          id: m.id, channelId: m.channelId, channelName: channelsById.get(m.channelId).name,
+          userId: m.userId, username: m.username, color: m.color,
+          content: m.content, createdAt: m.createdAt
+        });
+      }
+    }
+    return json(res, 200, { results });
   }
 
   match = url.pathname.match(/^\/api\/messages\/([a-z0-9]+)\/reactions$/);
@@ -1019,6 +1312,15 @@ function migrate() {
       changed = true;
     }
   }
+  for (const u of store.db.users) {
+    if (!u.status) { u.status = 'online'; changed = true; }
+    if (u.statusText === undefined) { u.statusText = ''; changed = true; }
+    if (u.bio === undefined) { u.bio = ''; changed = true; }
+    if (u.avatarFile === undefined) { u.avatarFile = null; u.avatarV = 0; changed = true; }
+  }
+  for (const s of store.db.servers) {
+    if (!s.bans) { s.bans = []; changed = true; }
+  }
   for (const msg of store.db.messages) {
     if (!msg.reactions) {
       msg.reactions = {};
@@ -1026,6 +1328,14 @@ function migrate() {
     }
     if (msg.editedAt === undefined) {
       msg.editedAt = null;
+      changed = true;
+    }
+    if (msg.pinned === undefined) {
+      msg.pinned = false;
+      changed = true;
+    }
+    if (msg.mentionIds === undefined) {
+      msg.mentionIds = [];
       changed = true;
     }
   }
